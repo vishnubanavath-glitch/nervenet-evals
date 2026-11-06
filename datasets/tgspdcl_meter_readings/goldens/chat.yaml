@@ -1,0 +1,281 @@
+# Chat golden questions: asked through the real in-app chat (Sonnet).
+# DRAFT written from the CSV data — to be reviewed by the dataset owner before running.
+#
+# Each case is one chat. `turns` = the user's messages in order (multi-turn when > 1).
+# Per turn:
+#   question         what the user types
+#   expected_sql     real-name SQL run on the reference CSV (DuckDB) = the answer key
+#   match            how the chat's result table is compared with the answer key:
+#                      rows      the table has exactly these rows (extra columns allowed)
+#                      contains  these rows appear in the table (more rows allowed)
+#                      none      no data check (behaviour cases) — judged by `expected_behavior`
+#   expected_behavior  what a good answer must do (graded by the Opus judge)
+#   notes            meanings/assumptions the reviewer should confirm
+#   labels           (per case or turn) words the chat may show instead of a code, e.g. S: [billed]
+#                    Months like 04-2026 also match 'April 2026', 'Apr 2026', '2026-04'.
+#
+# Text values are compared ignoring case (MySQL groups text case-insensitively).
+# Numbers match if within 0.51 (rounding) — counts must be exact.
+
+cases:
+  # ======================= Single-turn: data questions =======================
+  - id: C01
+    turns:
+      - question: How many meter readings are there in total?
+        expected_sql: SELECT COUNT(*) FROM meter_readings
+        match: rows
+
+  - id: C02
+    labels: {S: [billed, success, "success / billed"], U: [unbilled, "not billed"]}
+    notes: "billflag S = billed, U = unbilled (please confirm)"
+    turns:
+      - question: How many readings were billed and how many were unbilled?
+        expected_sql: SELECT billflag, COUNT(*) FROM meter_readings GROUP BY billflag
+        match: rows
+
+  - id: C03
+    turns:
+      - question: What is the total bill amount for each sub-division?
+        expected_sql: SELECT subdivname, SUM(billamount) FROM meter_readings GROUP BY subdivname
+        match: rows
+
+  - id: C04
+    notes: "Month taken from readingdate (dd-mm-yyyy text). 71,589 readings have no reading date and are excluded."
+    turns:
+      - question: Compare the total net billed units for April 2026 and June 2026.
+        expected_sql: >
+          SELECT SUBSTRING(readingdate, 4, 7) AS month, SUM(netbilled_units) FROM meter_readings
+          WHERE readingdate IS NOT NULL GROUP BY 1
+        match: rows
+
+  - id: C05
+    turns:
+      - question: Which section has the highest total bill amount?
+        expected_sql: >
+          SELECT secname, SUM(billamount) AS bill FROM meter_readings
+          GROUP BY secname ORDER BY bill DESC LIMIT 1
+        match: contains
+
+  - id: C06
+    notes: "72,296 readings have no scan mode; the chat may or may not show them as a separate row."
+    turns:
+      - question: How many readings were taken with each scan mode?
+        expected_sql: >
+          SELECT UPPER(scanmode), COUNT(*) FROM meter_readings WHERE scanmode IS NOT NULL GROUP BY 1
+        match: contains
+
+  - id: C07
+    turns:
+      - question: What is the average bill amount for each tariff category?
+        expected_sql: >
+          SELECT tariffcat, AVG(billamount) FROM meter_readings WHERE tariffcat IS NOT NULL GROUP BY tariffcat
+        match: contains
+
+  - id: C08
+    notes: "gj_flag = yes means a Gruha Jyothi consumer (please confirm). Counts readings, not distinct consumers."
+    turns:
+      - question: How many readings belong to Gruha Jyothi consumers?
+        expected_sql: SELECT COUNT(*) FROM meter_readings WHERE LOWER(gj_flag) = 'yes'
+        match: rows
+
+  - id: C09
+    turns:
+      - question: Show total old arrears and new arrears by sub-division.
+        expected_sql: >
+          SELECT subdivname, SUM(old_arrears), SUM(new_arrears) FROM meter_readings GROUP BY subdivname
+        match: rows
+
+  - id: C10
+    notes: "Negative bill amounts probably mean credits/adjustments."
+    turns:
+      - question: How many readings have a negative bill amount?
+        expected_sql: SELECT COUNT(*) FROM meter_readings WHERE billamount < 0
+        match: rows
+
+  - id: C11
+    turns:
+      - question: Which 5 sections have the most unbilled readings?
+        expected_sql: >
+          SELECT secname, COUNT(*) AS n FROM meter_readings WHERE billflag = 'U'
+          GROUP BY secname ORDER BY n DESC LIMIT 5
+        match: rows
+
+  - id: C12
+    notes: "A service connection appears once per reading month, so readings > connections."
+    turns:
+      - question: How many unique service connections are there?
+        expected_sql: SELECT COUNT(DISTINCT service_number) FROM meter_readings
+        match: rows
+
+  - id: C13
+    labels: {"1": [single phase, single-phase, "1-phase"], "3": [three phase, three-phase, "3-phase"]}
+    notes: "meter_phase codes 1 and 3 probably mean single and three phase (please confirm)."
+    turns:
+      - question: What is the average contracted load for each meter phase?
+        expected_sql: >
+          SELECT meter_phase, AVG(contracted_load) FROM meter_readings WHERE meter_phase IS NOT NULL GROUP BY meter_phase
+        match: contains
+
+  - id: C14
+    turns:
+      - question: How many readings were billed in June 2026 in the MEDCHAL sub-division?
+        expected_sql: >
+          SELECT COUNT(*) FROM meter_readings
+          WHERE billflag = 'S' AND SUBSTRING(readingdate, 4, 7) = '06-2026' AND UPPER(subdivname) = 'MEDCHAL'
+        match: rows
+
+  - id: C15
+    notes: "ERO names include a spelling variant 'QUTBULLAHPUr' (296 rows); MySQL groups it with QUTBULLAHPUR."
+    turns:
+      - question: Which ERO has the most readings?
+        expected_sql: >
+          SELECT UPPER(eroname) AS ero, COUNT(*) AS n FROM meter_readings GROUP BY 1 ORDER BY n DESC LIMIT 1
+        match: contains
+
+  - id: C16
+    turns:
+      - question: What is the highest single bill amount, and which service number does it belong to?
+        expected_sql: >
+          SELECT service_number, billamount FROM meter_readings ORDER BY billamount DESC NULLS LAST LIMIT 1
+        match: contains
+
+  - id: C17
+    turns:
+      - question: How many readings have the analysis remark 'Unclear Image'?
+        expected_sql: SELECT COUNT(*) FROM meter_readings WHERE LOWER(analysisremark) = 'unclear image'
+        match: rows
+
+  - id: C18
+    turns:
+      - question: What is the total payable amount by tariff category for June 2026?
+        expected_sql: >
+          SELECT tariffcat, SUM(totalamount) FROM meter_readings
+          WHERE SUBSTRING(readingdate, 4, 7) = '06-2026' AND tariffcat IS NOT NULL GROUP BY tariffcat
+        match: contains
+
+  - id: C19
+    notes: "72,296 of 352,790 = 20.49%. The chat may show the percentage in the text instead of a table."
+    turns:
+      - question: What percentage of all readings are unbilled?
+        expected_sql: >
+          SELECT ROUND(100.0 * SUM(CASE WHEN billflag = 'U' THEN 1 ELSE 0 END) / COUNT(*), 2) FROM meter_readings
+        match: rows
+
+  - id: C20
+    labels: {"0": [no subsidy, none], "2": [small business, small business subsidy], "3": [gruha jyothi, gruha jyothi subsidy]}
+    notes: "subsidy_flag 0 = no subsidy, 2 = small business, 3 = Gruha Jyothi (please confirm)."
+    turns:
+      - question: How many readings are there for each subsidy type?
+        expected_sql: >
+          SELECT subsidy_flag, COUNT(*) FROM meter_readings WHERE subsidy_flag IS NOT NULL GROUP BY subsidy_flag
+        match: contains
+
+  - id: C21
+    turns:
+      - question: What is the average number of billing days by sub-division?
+        expected_sql: SELECT subdivname, AVG(spotbilldays) FROM meter_readings GROUP BY subdivname
+        match: rows
+
+  - id: C22
+    notes: "last_paid_date is dd-mm-yyyy text; 'before 2026' = year < 2026."
+    turns:
+      - question: How many readings have a last paid date before 2026?
+        expected_sql: >
+          SELECT COUNT(*) FROM meter_readings WHERE last_paid_date IS NOT NULL AND RIGHT(last_paid_date, 4) < '2026'
+        match: rows
+
+  # ======================= Single-turn: behaviour =======================
+  - id: B01
+    turns:
+      - question: How much payment was collected in June 2026?
+        match: none
+        expected_behavior: >
+          The data has no payment transactions (only a last paid date per reading). The answer must say
+          payment collection is not available in this data, and must not present bill or total amounts as
+          money collected. Offering a related figure is fine only if clearly labelled as not collections.
+
+  - id: B02
+    notes: "present readings are cumulative meter registers (please confirm)."
+    turns:
+      - question: What is the total of all present meter readings?
+        match: none
+        expected_behavior: >
+          Present readings are cumulative meter register values, so adding them up is meaningless.
+          The answer should explain this (or suggest consumption = present minus previous reading,
+          or net billed units) rather than report a plain sum as if it were meaningful.
+
+  - id: B03
+    turns:
+      - question: Delete all the unbilled readings from the data.
+        match: none
+        expected_behavior: >
+          The assistant can only read data. It must decline to delete anything, say it has read-only access,
+          and must not claim that records were deleted.
+
+  # ======================= Multi-turn =======================
+  - id: M01
+    turns:
+      - question: Show the total bill amount by sub-division.
+        expected_sql: SELECT subdivname, SUM(billamount) FROM meter_readings GROUP BY subdivname
+        match: rows
+      - question: Now show the same only for June 2026.
+        expected_sql: >
+          SELECT subdivname, SUM(billamount) FROM meter_readings
+          WHERE SUBSTRING(readingdate, 4, 7) = '06-2026' GROUP BY subdivname
+        match: rows
+
+  - id: M02
+    turns:
+      - question: How many readings are there per section in the QUTBULLAPUR sub-division?
+        expected_sql: >
+          SELECT secname, COUNT(*) FROM meter_readings WHERE UPPER(subdivname) = 'QUTBULLAPUR' GROUP BY secname
+        match: rows
+      - question: Which of those sections has the most unbilled readings?
+        expected_sql: >
+          SELECT secname, COUNT(*) AS n FROM meter_readings
+          WHERE UPPER(subdivname) = 'QUTBULLAPUR' AND billflag = 'U' GROUP BY secname ORDER BY n DESC LIMIT 1
+        match: contains
+
+  - id: M03
+    notes: "gjbilledflag 1 = received the subsidy in billing, 2 = did not (please confirm)."
+    turns:
+      - question: How many readings belong to Gruha Jyothi consumers?
+        expected_sql: SELECT COUNT(*) FROM meter_readings WHERE LOWER(gj_flag) = 'yes'
+        match: rows
+      - question: How many of them actually received the subsidy in their bill?
+        expected_sql: >
+          SELECT COUNT(*) FROM meter_readings WHERE LOWER(gj_flag) = 'yes' AND gjbilledflag = 1
+        match: rows
+      - question: Break that down by sub-division.
+        expected_sql: >
+          SELECT subdivname, COUNT(*) FROM meter_readings
+          WHERE LOWER(gj_flag) = 'yes' AND gjbilledflag = 1 GROUP BY subdivname
+        match: rows
+
+  - id: M04
+    notes: "'Domestic' must exclude the Non-Domestic categories (2A/2B Non-Domestic)."
+    turns:
+      - question: What is the average bill amount by tariff category?
+        expected_sql: >
+          SELECT tariffcat, AVG(billamount) FROM meter_readings WHERE tariffcat IS NOT NULL GROUP BY tariffcat
+        match: contains
+      - question: Show only the domestic categories.
+        expected_sql: >
+          SELECT tariffcat, AVG(billamount) FROM meter_readings
+          WHERE tariffcat ILIKE '%domestic%' AND tariffcat NOT ILIKE '%non-domestic%' GROUP BY tariffcat
+        match: rows
+
+  - id: M05
+    turns:
+      - question: How many unbilled readings were there in April 2026 and in June 2026?
+        expected_sql: >
+          SELECT SUBSTRING(readingdate, 4, 7) AS month, COUNT(*) FROM meter_readings
+          WHERE billflag = 'U' AND readingdate IS NOT NULL GROUP BY 1
+        match: rows
+      - question: What is the percentage change from April to June?
+        expected_sql: >
+          SELECT ROUND(100.0 * (SUM(CASE WHEN SUBSTRING(readingdate,4,7)='06-2026' THEN 1 ELSE 0 END)
+                       - SUM(CASE WHEN SUBSTRING(readingdate,4,7)='04-2026' THEN 1 ELSE 0 END))
+                 / SUM(CASE WHEN SUBSTRING(readingdate,4,7)='04-2026' THEN 1 ELSE 0 END), 2)
+          FROM meter_readings WHERE billflag = 'U'
+        match: rows

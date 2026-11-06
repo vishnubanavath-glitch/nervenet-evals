@@ -1,0 +1,43 @@
+# Evaluation dataset: TGSPDCL meter readings.
+# Copy this folder to add another dataset; only this file and goldens/ change.
+
+name = "tgspdcl_meter_readings"
+description = "TGSPDCL meter readings (MySQL source 'tgspdcl'), MEDCHAL circle, Apr and Jun 2026"
+
+[source]
+# "database": the app queries the live source; `reference_path` is a CSV export of the
+#             same data, used only to calculate expected answers and find sensitive values.
+# "file":     the app queries an uploaded file; set `original_path`/`eval_path` (+ optional slice).
+kind = "database"
+reference_path = "D:/nervenet_tgspdcl_test/meter_readings.csv"  # never modified
+reference_table = "meter_readings"                              # table the CSV was exported from
+
+# Read these CSV columns as text so the answer key matches how MySQL stores them
+# (DuckDB would otherwise guess booleans/dates). MySQL also compares text case-insensitively.
+[source.reference_types]
+gj_flag = "VARCHAR"
+readingdate = "VARCHAR"
+last_paid_date = "VARCHAR"
+previous_reading_date = "VARCHAR"
+
+# Existing tenant and source in the app.
+[tenant]
+slug = "tgspdcl"
+source_id = "tgspdcl"
+
+# Test users. Key = label used in reports and goldens, email = login,
+# role = Role code held in the tenant. `can_query = false` = must be refused.
+[users.full_access]
+email = "eval.full@nervenet.local"
+role = "ANALYST"
+can_query = true
+
+# Schema-context evaluation: the table to generate for, and columns that hold personal
+# data, which a good generator should SUGGEST as pii/confidential (whatever the app setting is).
+[schema_context]
+tables = ["meter_readings"]
+personal_columns = ["name", "address_1", "address_2", "mobile_number", "aaomobileno"]
+
+# Columns that must be protected, with the classification they must carry, e.g. mobile_number = "pii".
+# None for this dataset: all columns are classified public in the app (user's decision, 2026-11-06).
+[sensitive_columns]

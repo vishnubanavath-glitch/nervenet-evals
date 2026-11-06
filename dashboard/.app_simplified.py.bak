@@ -1,0 +1,810 @@
+"""NerveNet evaluation dashboard (local, Streamlit).
+
+    cd "E:\\BSS\\nervenet ai\\nervenet-evals"
+    uv run streamlit run dashboard/app.py
+
+Reads results/ and datasets/ from disk. Everything stays on this machine.
+Layout: one page per result type, everything visible, no hidden steps.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import data as D  # noqa: E402
+import ui  # noqa: E402
+
+st.set_page_config(page_title="NerveNet Evals", page_icon=":material/fact_check:", layout="wide")
+ui.inject_css()
+
+
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=5, show_spinner=False)
+def runs_cached() -> list[D.Run]:
+    return D.list_runs()
+
+
+@st.cache_data(show_spinner=False)
+def cases_cached(path: str, mtime: float) -> dict:
+    run = next((r for r in D.list_runs() if str(r.path) == path), None)
+    return D.load_cases(run) if run else {}
+
+
+def run_cases(run: D.Run) -> dict:
+    mtime = max((p.stat().st_mtime for p in run.path.glob("*.json")), default=0)
+    return cases_cached(str(run.path), mtime)
+
+
+def run_headline(run: D.Run) -> tuple[str, str]:
+    """(pass rate text, cost text)."""
+    s = run.summary or {}
+    if run.kind == "chat":
+        cases = run_cases(run)
+        if not cases:
+            return "-", "-"
+        statuses = [D.chat_case_status(c) for c in cases.values()]
+        rate = f"{100 * statuses.count('Passed') / len(statuses):.0f}% ({statuses.count('Passed')}/{len(statuses)})"
+        cost = s.get("chat_cost_usd", 0) + s.get("judge_cost_usd", 0)
+        return rate, (f"${cost:.2f}" if s else "-")
+    if run.kind == "tools":
+        c = s.get("counts") or {}
+        total = sum(c.values()) - c.get("SKIP", 0)
+        return (f"{100 * c.get('PASS', 0) / total:.0f}% ({c.get('PASS', 0)}/{total})" if total else "-"), "$0.00"
+    if run.kind == "schema-context":
+        steps = (s.get("steps") or {}).values()
+        judged = sum(x.get("columns_judged", 0) for x in steps)
+        passed = sum(x.get("columns_passed", 0) for x in steps)
+        cost = sum((x.get("judge_cost_usd") or 0) + (x.get("haiku_cost_usd") or 0) for x in steps)
+        return (f"{100 * passed / judged:.0f}% ({passed}/{judged} columns)" if judged else "checks only"), f"${cost:.2f}"
+    return "-", "-"
+
+
+def run_size(run: D.Run) -> str:
+    n = len([k for k in run_cases(run) if k != "profile"])
+    if run.kind == "chat":
+        return f"{n} question{'s' if n != 1 else ''}"
+    if run.kind == "tools":
+        return f"{n} tests"
+    return f"{n} step{'s' if n != 1 else ''}"
+
+
+def run_picker(kind: str) -> D.Run | None:
+    """All runs of one type as visible buttons; the latest is selected."""
+    runs = [r for r in runs_cached() if r.kind == kind]
+    datasets = sorted({r.dataset for r in runs})
+    if not runs:
+        st.info("No runs of this type yet. Start one from **Run evaluation** (top bar).")
+        return None
+    if len(datasets) > 1:
+        ds = st.segmented_control("Dataset", datasets, default=datasets[0], key=f"ds_{kind}")
+        runs = [r for r in runs if r.dataset == ds]
+    labels = {f"{r.started:%d %b %H:%M} · {run_size(r)}" if r.started else r.run_id: r for r in runs}
+    choice = st.pills("Run", list(labels), default=list(labels)[0], key=f"pick_{kind}")
+    return labels.get(choice or list(labels)[0])
+
+
+# ---------------------------------------------------------------------------
+# Home
+# ---------------------------------------------------------------------------
+
+def page_home() -> None:
+    ui.page_header("NerveNet", "Latest results of each evaluation. Use the top bar or the buttons below.",
+                   accent="evaluations")
+    runs = runs_cached()
+    cols = st.columns(3)
+    for col, (kind, page, what) in zip(cols, (
+            ("chat", PAGE_CHAT, "Questions through the real chat, scored by Opus"),
+            ("tools", PAGE_TOOLS, "Data tools tested directly: numbers, masking, safety"),
+            ("schema-context", PAGE_SCHEMA, "How well the AI describes the table"))):
+        latest = next((r for r in runs if r.kind == kind), None)
+        with col:
+            with st.container(border=True):
+                st.markdown(f"#### {D.KIND_LABEL[kind]}")
+                st.caption(what)
+                if latest:
+                    rate, cost = run_headline(latest)
+                    st.metric("Latest pass rate", rate.split(" ")[0], help=rate)
+                    st.caption(f"{latest.started:%d %b %Y, %H:%M} · {run_size(latest)} · cost {cost}")
+                else:
+                    st.metric("Latest pass rate", "-")
+                    st.caption("No run yet")
+                st.page_link(page, label=f"Open {D.KIND_LABEL[kind].lower()}", icon=":material/arrow_forward:")
+    st.write("")
+    c1, c2 = st.columns(2)
+    with c1:
+        with st.container(border=True):
+            st.markdown("#### Golden datasets")
+            st.caption("The questions and tests, with expected answers from the CSV. View and edit them.")
+            st.page_link(PAGE_GOLDENS, label="Open golden datasets", icon=":material/arrow_forward:")
+    with c2:
+        with st.container(border=True):
+            st.markdown("#### Run evaluation")
+            st.caption("Start a new evaluation and watch it live.")
+            st.page_link(PAGE_LAUNCH, label="Start an evaluation", icon=":material/arrow_forward:")
+
+
+# ---------------------------------------------------------------------------
+# Chat results
+# ---------------------------------------------------------------------------
+
+def page_chat() -> None:
+    ui.page_header("Chat", "Questions asked through the real chat: data checks, Opus scores and remarks.",
+                   accent="results")
+    run = run_picker("chat")
+    if not run:
+        return
+    cases = run_cases(run)
+    if not cases:
+        st.warning("This run has no saved questions (it was interrupted).")
+        return
+    chat_overview(run, cases)
+    chat_list(run, cases)
+
+
+def chat_overview(run: D.Run, cases: dict) -> None:
+    s = run.summary or {}
+    statuses = {cid: D.chat_case_status(c) for cid, c in cases.items()}
+    passed = sum(1 for v in statuses.values() if v == "Passed")
+    turns = [t for c in cases.values() for t in c.get("turns", [])]
+    duration = sum(t.get("duration_ms", 0) for t in turns) / 1000
+    ui.section("Overview")
+    ui.meta_line([("Dataset", run.dataset), ("Questions", str(len(cases))), ("Chat time", f"{duration / 60:.1f} min"),
+                  ("Chat cost", f"${s.get('chat_cost_usd', 0):.2f}"), ("Judge cost", f"${s.get('judge_cost_usd', 0):.2f}"),
+                  ("Judge", D.judge_model_name()), ("Run", run.run_id)])
+    st.write("")
+    data_turns = [t for t in turns if t.get("match") != "none"]
+    data_ok = sum(1 for t in data_turns if t.get("checks") and t["checks"][0].get("passed"))
+    checks_ok = sum(1 for t in turns if all(c.get("passed") for c in t.get("checks", [])))
+    gov_ok = sum(1 for t in turns if all(g.get("passed") for g in t.get("governance", [])))
+
+    left, right = st.columns([2, 7])
+    with left:
+        ui.gauge(100 * passed / len(cases), f"{passed} of {len(cases)} questions pass")
+    with right:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            ui.card("Correct data shown", f"{data_ok}/{len(data_turns)}", "table matches the answer key",
+                    bad=data_ok < len(data_turns))
+        with c2:
+            ui.card("All code checks", f"{checks_ok}/{len(turns)}", "data, model, tools, order", bad=checks_ok < len(turns))
+        with c3:
+            ui.card("Governance clean", f"{gov_ok}/{len(turns)}", "no real names reached the AI", bad=gov_ok < len(turns))
+        st.write("")
+        scores = D.chat_metric_scores(cases)
+        names = [m for m in D.TURN_METRICS + D.CONV_METRICS if m in scores]
+        if names:
+            mcols = st.columns(len(names))
+            for col, m in zip(mcols, names):
+                vals = scores[m]
+                avg = sum(v for _, v, _ in vals) / len(vals)
+                fails = sum(1 for *_, ok in vals if not ok)
+                with col:
+                    ui.card(D.METRIC_LABEL.get(m, m), f"{avg:.2f}", f"{len(vals) - fails} pass · {fails} fail",
+                            bad=avg < D.THRESHOLD)
+        else:
+            st.caption("This run was not judged (code checks only).")
+
+    scores = D.chat_metric_scores(cases)
+    if scores:
+        names = [m for m in D.TURN_METRICS + D.CONV_METRICS if m in scores]
+        with st.expander("Score distribution per metric", expanded=False):
+            cols = st.columns(min(3, len(names)))
+            for i, m in enumerate(names):
+                with cols[i % len(cols)]:
+                    ui.histogram(D.METRIC_LABEL.get(m, m), [v for _, v, _ in scores[m]],
+                                 ui.METRIC_COLORS[i % len(ui.METRIC_COLORS)])
+
+
+def chat_list(run: D.Run, cases: dict) -> None:
+    statuses = {cid: D.chat_case_status(c) for cid, c in cases.items()}
+    ui.section("Questions")
+    n_pass = sum(1 for v in statuses.values() if v == "Passed")
+    flt = st.segmented_control(
+        "Show", [f"All ({len(cases)})", f"Passed ({n_pass})", f"Failed ({len(cases) - n_pass})"],
+        default=f"All ({len(cases)})", key=f"flt_{run.run_id}")
+    flt = (flt or "All").split(" ")[0]
+    st.caption("Click a question to open everything about it.")
+    for cid, rec in cases.items():
+        status = statuses[cid]
+        if flt == "Passed" and status != "Passed" or flt == "Failed" and status == "Passed":
+            continue
+        turns = rec.get("turns", [])
+        first = turns[0]["question"] if turns else rec.get("error", "")
+        scores = []
+        for m in D.TURN_METRICS:
+            vals = [t["judge"][m]["score"] for t in turns if (t.get("judge") or {}).get(m, {}).get("score") is not None]
+            if vals:
+                scores.append(f"{D.METRIC_LABEL[m][:7]} {sum(vals) / len(vals):.2f}")
+        icon = "✅" if status == "Passed" else "❌"
+        extra = f" ({len(turns)} turns)" if len(turns) > 1 else ""
+        with st.expander(f"{icon} **{cid}**{extra} · {first}   —   {' · '.join(scores)}"):
+            chat_case_body(rec, status, prefix=run.run_id)
+
+
+def chat_case_body(rec: dict, status: str, prefix: str = "") -> None:
+    if rec.get("notes"):
+        st.caption(f"Golden note: {rec['notes']}")
+    if rec.get("error"):
+        st.error(rec["error"])
+        return
+    turns = rec.get("turns", [])
+    multi = len(turns) > 1
+    conv = rec.get("conversation_judge") or {}
+    if conv:
+        st.markdown("**Whole conversation**")
+        cc = st.columns(len(conv))
+        for col, (m, v) in zip(cc, conv.items()):
+            with col:
+                metric_box(m, v)
+    for t in turns:
+        if multi:
+            ui.section(f"{t['name']} · {t['question']}")
+        left, right = st.columns([5, 6], gap="large")
+        with left:
+            st.markdown("**Conversation**")
+            ui.chat_bubble("user", t["question"])
+            ui.chat_bubble("assistant", t.get("answer_raw") or t.get("answer") or "")
+            for tb in (t.get("turn_detail") or {}).get("ui_tables") or []:
+                if tb.get("rows"):
+                    st.caption(f"Table shown to the user · {tb.get('title') or ''} ({len(tb['rows'])} rows)")
+                    st.dataframe(pd.DataFrame(tb["rows"]), hide_index=True, width="stretch", height=180)
+        with right:
+            st.markdown("**Scores (Opus)**")
+            if t.get("judge"):
+                for m, v in t["judge"].items():
+                    metric_box(m, v)
+            else:
+                st.caption("Not judged.")
+            st.markdown("**Remarks**")
+            remarks_block(t.get("remarks"))
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Checks**")
+            rows = [{"Check": c["name"], "Result": "✅ PASS" if c["passed"] else "❌ FAIL", "Detail": c.get("detail", "")}
+                    for c in t.get("checks", [])]
+            rows += [{"Check": f"governance: {g['name']}", "Result": "✅ PASS" if g["passed"] else "❌ FAIL",
+                      "Detail": g.get("detail", "")} for g in t.get("governance", [])]
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        with c2:
+            st.markdown("**Expected answer**")
+            if t.get("match") == "none":
+                st.info(" ".join((t.get("expected_behavior") or "").split()))
+            else:
+                exp = t.get("expected") or {}
+                st.caption(f"From the CSV · match: {t.get('match')}")
+                if exp.get("rows") is not None:
+                    st.dataframe(pd.DataFrame(exp["rows"], columns=exp.get("columns")), hide_index=True, width="stretch")
+        trace_block(t, key=f"{prefix}_{rec['id']}_{t['name']}")
+
+
+def metric_box(name: str, v: dict) -> None:
+    ok = D.metric_ok(v)
+    status = "Errored" if v.get("error") else ("Pass" if ok else "Fail")
+    with st.container(border=True):
+        st.markdown(f"{ui.status_badge('Passed' if ok else 'Failed')} **{D.METRIC_LABEL.get(name, name)}** "
+                    f"&nbsp; {ui.fmt_score(v.get('score'))} <span class='nv-meta'>(pass ≥ {D.THRESHOLD})</span>",
+                    unsafe_allow_html=True)
+        st.caption(v.get("reason") or "-")
+        if v.get("error"):
+            st.error(v["error"])
+
+
+def remarks_block(r: dict | None) -> None:
+    if not r:
+        st.caption("No remarks for this answer.")
+        return
+    if r.get("error"):
+        st.error(r["error"])
+        return
+    for title, key, kind in (("What's good", "whats_good", "pass"), ("What's bad", "whats_bad", "fail"),
+                             ("What can be improved", "improvements", "warn")):
+        items = r.get(key) or []
+        st.markdown(ui.badge(title, kind), unsafe_allow_html=True)
+        st.markdown("\n".join(f"- {x}" for x in items) if items else "_none_")
+
+
+def trace_block(t: dict, key: str) -> None:
+    trace = (t.get("turn_detail") or {}).get("trace") or {}
+    usage = t.get("usage") or {}
+    st.markdown("**Tools, SQL and cost**")
+    ui.meta_line([("Model", ", ".join(trace.get("models_used", [])) or "-"),
+                  ("LLM calls", str(usage.get("llm_calls", "-"))),
+                  ("Tokens in", f"{usage.get('total_input_tokens', 0):,}"),
+                  ("Tokens out", f"{usage.get('output_tokens', 0):,}"),
+                  ("Cost", f"${t.get('chat_cost_usd', 0):.3f}"), ("Time", f"{t.get('duration_ms', 0) / 1000:.1f}s")])
+    tools = trace.get("tool_calls") or []
+    if tools:
+        st.dataframe(pd.DataFrame([{
+            "#": i + 1, "Tool": tc["name"], "Error": "yes" if tc.get("is_error") else "", "ms": tc.get("duration_ms"),
+            "Arguments": json.dumps({k: v for k, v in (tc.get("arguments") or {}).items()
+                                     if k not in ("tenant_id", "user_id", "organization_id")}, ensure_ascii=False)[:300],
+        } for i, tc in enumerate(tools)]), hide_index=True, width="stretch")
+    for sql in t.get("sql") or []:
+        st.code(sql, language="sql")
+    calls = trace.get("llm_calls") or []
+    if calls and st.toggle("Show full trace (history sent, system prompt, what the AI received)", key=f"tr_{key}"):
+        st.markdown(f"**History sent to the AI** ({len(calls[0]['request']['messages'])} message(s) in the first call)")
+        for m in calls[0]["request"]["messages"]:
+            content = m.get("content")
+            text = content if isinstance(content, str) else " ".join(
+                b.get("text", f"[{b.get('type')}]") for b in content if isinstance(b, dict))
+            st.markdown(f"- **{m.get('role')}**: {text[:1500]}")
+        st.markdown("**System prompt**")
+        sp = calls[0]["request"].get("system")
+        st.code(sp if isinstance(sp, str) else json.dumps(sp, ensure_ascii=False, indent=1)[:20000], language="text")
+        st.markdown("**What the AI received from each tool**")
+        for tc in tools:
+            seen = tc.get("result_seen_by_model")
+            st.caption(tc["name"])
+            st.code((seen if isinstance(seen, str) else json.dumps(seen, ensure_ascii=False))[:6000], language="json")
+
+
+# ---------------------------------------------------------------------------
+# Tools results
+# ---------------------------------------------------------------------------
+
+AREA_LABEL = {"results": "Correct numbers", "naming": "Real names hidden", "limits": "Row limits",
+              "safety": "Dangerous SQL blocked", "isolation": "Tenants kept apart", "kpi": "KPI summary",
+              "access": "Role access"}
+
+
+def page_tools() -> None:
+    ui.page_header("Tools", "Your data tools tested directly, without AI: numbers, masking, safety, limits.",
+                   accent="results")
+    run = run_picker("tools")
+    if not run:
+        return
+    s = run.summary or {}
+    cases = run_cases(run)
+    c = s.get("counts") or {}
+    total = sum(c.values()) - c.get("SKIP", 0)
+    ui.section("Overview")
+    ui.meta_line([("Dataset", run.dataset), ("Tests", str(len(cases))), ("Cost", "$0.00 (no AI)"), ("Run", run.run_id)])
+    left, right = st.columns([2, 7])
+    with left:
+        ui.gauge(100 * c.get("PASS", 0) / total if total else 0, f"{c.get('PASS', 0)} of {total} tests pass")
+    with right:
+        areas = list((s.get("by_area") or {}).items())
+        cols = st.columns(min(4, len(areas)) or 1)
+        for i, (a, v) in enumerate(areas):
+            n = sum(v.get(k, 0) for k in ("PASS", "FAIL", "ERROR"))
+            with cols[i % len(cols)]:
+                sub = f"{v.get('FAIL', 0)} fail" + (f" · {v.get('SKIP')} skipped" if v.get("SKIP") else "")
+                ui.card(AREA_LABEL.get(a, a), f"{v.get('PASS', 0)}/{n}" if n else "skipped", sub,
+                        bad=bool(v.get("FAIL") or v.get("ERROR")))
+                st.write("")
+
+    ui.section("Tests")
+    flt = st.segmented_control("Show", ["All", "Passed", "Failed", "Skipped"], default="All", key=f"tf_{run.run_id}")
+    want = {"All": None, "Passed": "PASS", "Failed": "FAIL", "Skipped": "SKIP"}[flt or "All"]
+    by_area: dict[str, list] = {}
+    for k, v in cases.items():
+        if want is None or v.get("status") == want:
+            by_area.setdefault(v.get("area", ""), []).append(v)
+    for area, items in by_area.items():
+        st.markdown(f"**{AREA_LABEL.get(area, area)}**")
+        for r in items:
+            icon = {"PASS": "✅", "FAIL": "❌", "SKIP": "⏭️"}.get(r.get("status"), "⚠️")
+            with st.expander(f"{icon} **{r['id']}** · {r.get('title')}   —   {r.get('detail', '')[:90]}"):
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("**Sent to the tool (masked)**")
+                    st.json(r.get("sent") or {})
+                    if r.get("reference_sql"):
+                        st.markdown("**Answer-key SQL (real names, on the CSV)**")
+                        st.code(r["reference_sql"], language="sql")
+                    if r.get("expected"):
+                        st.markdown("**Expected result**")
+                        st.dataframe(pd.DataFrame(r["expected"]["rows"], columns=r["expected"]["columns"]),
+                                     hide_index=True)
+                with c2:
+                    st.markdown("**Result**")
+                    st.write(r.get("detail"))
+                    st.markdown("**Tool returned**")
+                    st.json(r.get("received") or {}, expanded=1)
+                    if r.get("local_only"):
+                        st.markdown("**Details (local only)**")
+                        st.json(r["local_only"])
+
+
+# ---------------------------------------------------------------------------
+# Schema-context results
+# ---------------------------------------------------------------------------
+
+STEP_LABEL = {"column_settings": "Column suggestions", "schema_context": "Whole draft context"}
+
+
+def page_schema() -> None:
+    ui.page_header("Schema context", "How well the AI (Haiku) describes your table, checked against the real data.",
+                   accent="results")
+    run = run_picker("schema-context")
+    if not run:
+        return
+    s = run.summary or {}
+    cases = run_cases(run)
+    profile = (D._read_json(run.path / "profile.json") or {}).get("columns", {})
+    steps = [k for k in ("column_settings", "schema_context") if k in (s.get("steps") or {})]
+    if not steps:
+        st.info("No steps recorded in this run.")
+        return
+    step = st.segmented_control("Step", steps, default=steps[0], key=f"st_{run.run_id}",
+                                format_func=lambda k: STEP_LABEL.get(k, k)) or steps[0]
+    info = s["steps"][step]
+    ui.section("Overview")
+    if info.get("error"):
+        st.error(info["error"])
+        return
+    ui.meta_line([("Dataset", run.dataset), ("Haiku cost", f"${info.get('haiku_cost_usd') or 0:.4f}"),
+                  ("Judge cost", f"${info.get('judge_cost_usd') or 0:.2f}"), ("Run", run.run_id)])
+    judged, passed = info.get("columns_judged", 0), info.get("columns_passed", 0)
+    left, mid, right = st.columns([2, 4, 3])
+    with left:
+        if judged:
+            ui.gauge(100 * passed / judged, f"{passed} of {judged} columns pass")
+        else:
+            st.caption("Not judged (code checks only).")
+    with mid:
+        st.markdown("**Code checks**")
+        for name, v in (info.get("checks") or {}).items():
+            st.markdown(f"{'✅' if v['passed'] else '❌'} **{name}** <span class='nv-meta'>{v.get('detail', '')}</span>",
+                        unsafe_allow_html=True)
+    with right:
+        ts = info.get("table_score")
+        if ts:
+            ui.card("Table description", ui.fmt_score(ts.get("score")), "Opus score for purpose, grain, limits...",
+                    bad=not ts.get("passed"))
+            st.caption(ts.get("reason") or "")
+
+    rec = cases.get(step) or {}
+    sugg, scores = rec.get("suggestions") or {}, rec.get("column_scores") or {}
+    ui.section("Columns")
+    flt = st.segmented_control("Show", ["All", "Passed", "Failed"], default="All", key=f"cf_{run.run_id}_{step}")
+    for col, sg in sugg.items():
+        sc = scores.get(col) or {}
+        ok = sc.get("passed")
+        if flt == "Passed" and not ok or flt == "Failed" and ok:
+            continue
+        icon = "–" if not sc else ("✅" if ok else "❌")
+        with st.expander(f"{icon} **{col}** · {sg.get('label') or ''} · {sg.get('role') or '?'} · "
+                         f"{sg.get('sensitivity') or '?'}   —   {ui.fmt_score(sc.get('score'))}"):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**What the AI wrote**")
+                st.markdown(f"- **Label:** {sg.get('label')}\n- **Meaning:** {sg.get('meaning')}\n"
+                            f"- **Role:** {sg.get('role')}\n- **Sensitivity:** {sg.get('sensitivity')}\n"
+                            f"- **Synonyms:** {', '.join(sg.get('synonyms') or [])}")
+            with c2:
+                if sc:
+                    metric_box("Column description accuracy", sc)
+                if col in profile:
+                    from evals.profile import column_facts_text
+                    st.markdown("**Facts measured from the data**")
+                    st.caption(column_facts_text(col, profile[col]))
+
+
+# ---------------------------------------------------------------------------
+# Golden datasets
+# ---------------------------------------------------------------------------
+
+def real_sql(text: str) -> str:
+    """Tools-golden placeholders -> real names (for the answer key), without the app's catalog."""
+    text = re.sub(r"\{c:([^}]+)\}", lambda m: f'"{m.group(1)}"', text)
+    return re.sub(r"\{t:([^}]+)\}", lambda m: m.group(1), text)
+
+
+@st.cache_data(show_spinner="Calculating expected answers from the CSV...")
+def expected_answers(dataset: str, sqls: tuple[str, ...], csv_mtime: float) -> dict[str, dict]:
+    from evals.config import load_dataset
+    from evals.tools_eval import Reference
+
+    ref = Reference(load_dataset(dataset))
+    out = {}
+    for sql in sqls:
+        try:
+            cols, rows = ref.run(" ".join(sql.split()))
+            out[sql] = {"columns": cols, "rows": rows}
+        except Exception as exc:
+            out[sql] = {"error": str(exc)}
+    return out
+
+
+def validate_golden(kind: str, text: str) -> list[str]:
+    try:
+        doc = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        return [f"Not valid YAML: {exc}"]
+    cases = (doc or {}).get("cases")
+    if not isinstance(cases, list) or not cases:
+        return ["The file needs a top-level 'cases:' list with at least one case."]
+    problems, seen = [], set()
+    for i, c in enumerate(cases, 1):
+        cid = c.get("id") if isinstance(c, dict) else None
+        if not cid:
+            problems.append(f"Case #{i} has no id.")
+            continue
+        if cid in seen:
+            problems.append(f"{cid}: id used twice.")
+        seen.add(cid)
+        if kind == "chat":
+            turns = c.get("turns")
+            if not isinstance(turns, list) or not turns:
+                problems.append(f"{cid}: needs a 'turns' list.")
+                continue
+            for n, t in enumerate(turns, 1):
+                if not t.get("question"):
+                    problems.append(f"{cid} turn {n}: missing question.")
+                match = t.get("match", "rows" if t.get("expected_sql") else "none")
+                if match not in ("rows", "contains", "none"):
+                    problems.append(f"{cid} turn {n}: match must be rows, contains or none.")
+                if match != "none" and not t.get("expected_sql"):
+                    problems.append(f"{cid} turn {n}: needs expected_sql (or match: none + expected_behavior).")
+                if match == "none" and not t.get("expected_behavior"):
+                    problems.append(f"{cid} turn {n}: a behaviour case needs expected_behavior.")
+        else:
+            if not any(k in c for k in ("sql", "raw_sql", "raw_sql_template", "tool")):
+                problems.append(f"{cid}: needs sql, raw_sql, raw_sql_template or tool.")
+            allowed = {"match_reference", "rejected", "row_limit", "capped", "masked", "masked_headers",
+                       "kpi_matches", "not_listed"}
+            if c.get("expect") not in allowed:
+                problems.append(f"{cid}: expect must be one of {sorted(allowed)}.")
+    return problems
+
+
+def page_goldens() -> None:
+    ui.page_header("Golden", "The questions and tests each evaluation uses. Expected answers are calculated from the "
+                   "dataset's CSV.", accent="datasets")
+    datasets = D.list_datasets()
+    if not datasets:
+        st.info("No datasets under datasets/.")
+        return
+    dataset = st.selectbox("Dataset", datasets)
+    from evals.config import load_dataset
+    ds = load_dataset(dataset)
+    csv = Path(ds.reference_file) if ds.reference_file else None
+    st.markdown(f"<span class='nv-meta'>Source <b>{ds.source_id}</b> in tenant <b>{ds.tenant_slug}</b> · "
+                f"answer key <b>{csv}</b></span>", unsafe_allow_html=True)
+    which = st.segmented_control("Show", ["Chat questions", "Tools tests"], default="Chat questions",
+                                 key=f"gk_{dataset}") or "Chat questions"
+    kind = "chat" if which == "Chat questions" else "tools"
+    ui.section(which)
+    golden_editor(ds, dataset, kind, csv)
+
+
+def golden_editor(ds, dataset: str, kind: str, csv: Path | None) -> None:
+    path = D.golden_path(dataset, kind)
+    if not path.exists():
+        st.info(f"No {path.name} yet for this dataset.")
+        return
+    text = path.read_text(encoding="utf-8")
+    doc = yaml.safe_load(text) or {}
+    cases = doc.get("cases") or []
+    rows = []
+    sqls: list[str] = []
+    for c in cases:
+        if kind == "chat":
+            turns = c.get("turns") or []
+            rows.append({"ID": c.get("id"), "Turns": len(turns),
+                         "Questions": "  →  ".join(t.get("question", "") for t in turns),
+                         "Match": ", ".join(t.get("match", "rows" if t.get("expected_sql") else "none") for t in turns),
+                         "Notes": c.get("notes", "")})
+            sqls += [t["expected_sql"] for t in turns if t.get("expected_sql")]
+        else:
+            rows.append({"ID": c.get("id"), "Area": c.get("area"), "Test": c.get("title"), "Expect": c.get("expect")})
+            if c.get("expect") in ("match_reference", "kpi_matches") and c.get("sql"):
+                sqls.append(real_sql(c["sql"]))
+    st.markdown(f"**{len(cases)} {'question case(s)' if kind == 'chat' else 'test(s)'}** in `{path.name}`")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    if sqls and csv and csv.exists() and st.toggle("Show expected answers (calculated from the CSV)",
+                                                     key=f"exp_{dataset}_{kind}"):
+        answers = expected_answers(dataset, tuple(sqls), csv.stat().st_mtime)
+        for c in cases:
+            items = ([(t.get("question"), t.get("expected_sql"), t.get("expected_behavior")) for t in c.get("turns", [])]
+                     if kind == "chat" else [(c.get("title"), real_sql(c["sql"]) if c.get("sql") and
+                                              c.get("expect") in ("match_reference", "kpi_matches") else None, None)])
+            with st.expander(f"{c.get('id')} · {items[0][0] if items else ''}"):
+                if c.get("notes"):
+                    st.caption(f"Note to confirm: {c['notes']}")
+                for q, sql, behaviour in items:
+                    if len(items) > 1:
+                        st.markdown(f"**{q}**")
+                    if sql:
+                        a = answers.get(sql) or {}
+                        if a.get("error"):
+                            st.error(a["error"])
+                        else:
+                            st.dataframe(pd.DataFrame(a["rows"], columns=a["columns"]), hide_index=True)
+                        st.code(" ".join(sql.split()), language="sql")
+                    elif behaviour:
+                        st.info(" ".join(behaviour.split()))
+                    else:
+                        st.caption(f"Expectation: {c.get('expect')}")
+
+    with st.expander(f"Edit {path.name}"):
+        st.caption("Edit the YAML, press Validate, then Save. The previous version is kept in goldens/.history/.")
+        new = st.text_area("YAML", text, height=480, key=f"yaml_{dataset}_{kind}", label_visibility="collapsed")
+        b1, b2, _ = st.columns([1, 1, 6])
+        if b1.button("Validate", key=f"val_{dataset}_{kind}"):
+            problems = validate_golden(kind, new)
+            if problems:
+                st.error("\n".join(f"- {p}" for p in problems))
+            else:
+                st.success("Looks good.")
+        if b2.button("Save", type="primary", key=f"save_{dataset}_{kind}"):
+            problems = validate_golden(kind, new)
+            if problems:
+                st.error("Not saved:\n" + "\n".join(f"- {p}" for p in problems))
+            elif new == text:
+                st.info("No changes.")
+            else:
+                hist = path.parent / ".history"
+                hist.mkdir(exist_ok=True)
+                (hist / f"{path.stem}.{datetime.now():%Y%m%d-%H%M%S}.yaml").write_text(text, encoding="utf-8")
+                path.write_text(new, encoding="utf-8")
+                st.cache_data.clear()
+                st.success(f"Saved. Previous version kept in {hist.name}/.")
+                st.rerun()
+
+
+
+# ---------------------------------------------------------------------------
+# Run evaluation
+# ---------------------------------------------------------------------------
+
+@st.cache_resource
+def job_registry() -> dict:
+    return {}
+
+
+def job_running(job: dict) -> bool:
+    return bool(job.get("proc")) and job["proc"].poll() is None
+
+
+def start_job(cmd: list[str], label: str) -> None:
+    logs = D.RESULTS_DIR / "_dashboard_logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    log_path = logs / f"{datetime.now():%Y%m%d-%H%M%S}.log"
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+    fh = open(log_path, "w", encoding="utf-8")
+    proc = subprocess.Popen(cmd, cwd=D.EVALS_DIR, stdout=fh, stderr=subprocess.STDOUT, env=env)
+    job_registry().update(proc=proc, log=log_path, label=label, cmd=cmd, started=time.time(), fh=fh)
+
+
+def golden_ids(dataset: str, kind: str) -> list[str]:
+    path = D.golden_path(dataset, kind)
+    if not path.exists():
+        return []
+    return [c.get("id") for c in (yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("cases", []) if c.get("id")]
+
+
+def page_launch() -> None:
+    ui.page_header("Run", "Choose what to evaluate, check the estimated cost, then start. The log updates live.",
+                   accent="evaluation")
+    job = job_registry()
+    running = job_running(job)
+
+    datasets = D.list_datasets()
+    if not datasets:
+        st.info("No datasets under datasets/.")
+        return
+    c1, c2 = st.columns(2)
+    dataset = c1.selectbox("Dataset", datasets, disabled=running)
+    what = c2.selectbox("What to evaluate", ["Everything", "Chat responses", "Tools", "Schema context", "Setup check"],
+                        disabled=running)
+
+    py = sys.executable
+    scripts = D.EVALS_DIR / "scripts"
+    cmd: list[str] = []
+    estimate = ""
+    if what == "Everything":
+        judge = st.toggle("Opus judge (scores + remarks)", value=True, disabled=running)
+        cmd = [py, str(scripts / "run_all.py"), "--dataset", dataset] + ([] if judge else ["--no-judge"])
+        estimate = "about $8.50 and 25 minutes" if judge else "about $1.50 and 15 minutes"
+    elif what == "Chat responses":
+        ids = golden_ids(dataset, "chat")
+        pick = st.multiselect("Questions (leave empty for all)", ids, disabled=running)
+        o1, o2 = st.columns(2)
+        judge = o1.toggle("Opus judge (scores)", value=True, disabled=running)
+        remarks = o2.toggle("Remarks (good / bad / improve)", value=True, disabled=running or not judge)
+        n = len(pick) or len(ids)
+        cmd = [py, str(scripts / "eval_chat.py"), "--dataset", dataset]
+        cmd += ["--only", ",".join(pick)] if pick else []
+        cmd += [] if judge else ["--no-judge"]
+        cmd += [] if (remarks and judge) else ["--no-remarks"]
+        per = 0.05 + (0.15 if judge else 0) + (0.015 if judge and remarks else 0)
+        estimate = f"about ${n * per:.2f} and {max(1, round(n * 0.5))} minutes for {n} question(s)"
+    elif what == "Tools":
+        ids = golden_ids(dataset, "tools")
+        pick = st.multiselect("Tests (leave empty for all)", ids, disabled=running)
+        cmd = [py, str(scripts / "eval_tools.py"), "--dataset", dataset] + (["--only", ",".join(pick)] if pick else [])
+        estimate = "free (no AI), under a minute"
+    elif what == "Schema context":
+        step = st.radio("Step", ["both", "columns", "context"], horizontal=True, disabled=running,
+                        format_func={"both": "Both steps", "columns": "Column suggestions", "context": "Whole draft"}.get)
+        judge = st.toggle("Opus judge", value=True, disabled=running)
+        cmd = [py, str(scripts / "eval_schema_context.py"), "--dataset", dataset, "--step", step]
+        cmd += [] if judge else ["--no-judge"]
+        estimate = "about $1.50 and 5 minutes" if judge else "about $0.02 and 2 minutes"
+    else:
+        cmd = [py, str(scripts / "check_setup.py"), "--dataset", dataset, "--judge"]
+        estimate = "about $0.01, a few seconds"
+
+    st.markdown(f"<span class='nv-meta'>Estimated cost: <b>{estimate}</b></span>", unsafe_allow_html=True)
+    b1, b2, _ = st.columns([1, 1, 5])
+    if b1.button("Start", type="primary", disabled=running):
+        start_job(cmd, f"{what} · {dataset}")
+        st.rerun()
+    if b2.button("Stop", disabled=not running):
+        job["proc"].terminate()
+        st.warning("Stopping...")
+
+    if job.get("log"):
+        st.divider()
+        live_log()
+
+
+@st.fragment(run_every="2s")
+def live_log() -> None:
+    job = job_registry()
+    running = job_running(job)
+    elapsed = time.time() - job.get("started", time.time())
+    if running:
+        st.markdown(f"{ui.badge('RUNNING', 'warn')} **{job['label']}** · {elapsed / 60:.1f} min", unsafe_allow_html=True)
+    else:
+        code = job["proc"].returncode if job.get("proc") else None
+        if job.get("fh") and not job["fh"].closed:
+            job["fh"].close()
+        st.markdown(f"{ui.badge('FINISHED' if code == 0 else 'FINISHED WITH FAILURES', 'pass' if code == 0 else 'fail')} "
+                    f"**{job['label']}**", unsafe_allow_html=True)
+    try:
+        lines = Path(job["log"]).read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        lines = []
+    # The app prints large metadata blocks during chat runs; keep the log readable.
+    keep = [ln for ln in lines if ln.strip() and not ln.startswith(("  \"", "  {", "  }", "  ]", "    "))]
+    st.code("\n".join(keep[-60:]) or "(starting...)", language="text")
+    if not running:
+        st.caption(f"Full log: {job['log']}")
+        st.cache_data.clear()
+        c1, c2, c3 = st.columns(3)
+        c1.page_link(PAGE_CHAT, label="Open chat results", icon=":material/arrow_forward:")
+        c2.page_link(PAGE_TOOLS, label="Open tools results", icon=":material/arrow_forward:")
+        c3.page_link(PAGE_SCHEMA, label="Open schema-context results", icon=":material/arrow_forward:")
+
+
+
+
+# ---------------------------------------------------------------------------
+# Navigation (top bar)
+# ---------------------------------------------------------------------------
+
+# NV_DASH_START_PAGE (home | chat | tools | schema | goldens | evaluate) picks the first page; used by tests.
+_START = os.getenv("NV_DASH_START_PAGE", "home")
+PAGE_HOME = st.Page(page_home, title="Home", icon=":material/home:", default=_START == "home")
+PAGE_CHAT = st.Page(page_chat, title="Chat results", icon=":material/forum:", url_path="chat", default=_START == "chat")
+PAGE_TOOLS = st.Page(page_tools, title="Tools results", icon=":material/build:", url_path="tools",
+                     default=_START == "tools")
+PAGE_SCHEMA = st.Page(page_schema, title="Schema context", icon=":material/table_chart:", url_path="schema",
+                      default=_START == "schema")
+PAGE_GOLDENS = st.Page(page_goldens, title="Golden datasets", icon=":material/dataset:", url_path="goldens",
+                       default=_START == "goldens")
+PAGE_LAUNCH = st.Page(page_launch, title="Run evaluation", icon=":material/play_circle:", url_path="evaluate",
+                      default=_START == "evaluate")
+
+st.logo(str(Path(__file__).resolve().parent / "assets" / "logo.svg"), size="large")
+st.navigation([PAGE_HOME, PAGE_CHAT, PAGE_TOOLS, PAGE_SCHEMA, PAGE_GOLDENS, PAGE_LAUNCH], position="top").run()

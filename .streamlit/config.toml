@@ -1,0 +1,23 @@
+[theme]
+base = "dark"
+# Palette: #000814 page, #14213D panels, #000000 sidebar; #FCA311 accent, #E5E5E5 text.
+primaryColor = "#FCA311"
+backgroundColor = "#000814"
+secondaryBackgroundColor = "#14213D"
+textColor = "#E5E5E5"
+borderColor = "#22345F"
+font = "sans serif"
+
+[theme.sidebar]
+backgroundColor = "#000000"
+secondaryBackgroundColor = "#14213D"
+textColor = "#E5E5E5"
+
+[server]
+headless = true
+address = "localhost"
+port = 8501
+runOnSave = false
+
+[browser]
+gatherUsageStats = false

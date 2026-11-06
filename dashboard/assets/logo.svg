@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="260" height="48" viewBox="0 0 260 48">
+  <rect x="2" y="6" width="36" height="36" rx="9" fill="#FCA311"/>
+  <path d="M12 33V15h3.2l9.6 12.4V15H28v18h-3.2L15.2 20.6V33z" fill="#000814"/>
+  <text x="50" y="31" font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="700" fill="#E5E5E5">NerveNet</text>
+  <text x="146" y="31" font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="400" fill="#FCA311">Evals</text>
+</svg>
