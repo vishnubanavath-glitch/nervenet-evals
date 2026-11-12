@@ -37,6 +37,7 @@ class Case:
 
 
 def load_cases(ds: Dataset, filename: str = "tools.yaml") -> list[Case]:
+    """The cases in the dataset's goldens/tools.yaml."""
     path = ds.goldens_dir / filename
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     return [Case(id=c["id"], area=c["area"], title=c["title"], expect=c["expect"], spec=c) for c in raw["cases"]]

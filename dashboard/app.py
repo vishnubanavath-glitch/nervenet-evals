@@ -183,27 +183,24 @@ def chat_overview(run: D.Run) -> None:
                   ("Judge", D.judge_model_name())])
     st.write("")
 
-    left, mid, right = st.columns([2, 4, 5])
+    scores = D.chat_metric_scores(cases)
+    names = [m for m in D.TURN_METRICS + D.CONV_METRICS if m in scores]
+    left, mid, right = st.columns([2.2, 4.3, 4.5], gap="medium")
     with left:
-        ui.gauge(100 * passed / len(cases), f"{passed} of {len(cases)} test cases passing")
+        with st.container(border=True):
+            ui.gauge(100 * passed / len(cases), f"{passed} of {len(cases)} test cases passing")
     with mid:
-        st.markdown("**Test case scores** <span class='nv-meta'>(average judge score per case)</span>", unsafe_allow_html=True)
-        ui.score_strip([(cid, D.case_avg_score(c), statuses[cid] == "Passed")
-                        for cid, c in cases.items() if D.case_avg_score(c) is not None])
+        with st.container(border=True):
+            ui.caption_label("Test case scores")
+            ui.score_strip([(cid, D.case_avg_score(c), statuses[cid] == "Passed")
+                            for cid, c in cases.items() if D.case_avg_score(c) is not None])
     with right:
-        st.markdown("**Metrics**")
-        scores = D.chat_metric_scores(cases)
-        names = [m for m in D.TURN_METRICS + D.CONV_METRICS if m in scores]
-        cols = st.columns(2)
-        for i, m in enumerate(names):
-            vals = scores[m]
-            avg = sum(v for _, v, _ in vals) / len(vals)
-            fails = sum(1 for *_, ok in vals if not ok)
-            with cols[i % 2]:
-                ui.card(D.METRIC_LABEL.get(m, m), f"{avg:.2f}", f"{len(vals) - fails} passed · {fails} failed", bad=avg < 0.5)
-                st.write("")
-        if not names:
-            st.caption("This run was not judged (code checks only).")
+        with st.container(border=True):
+            ui.metrics_panel([{"name": D.METRIC_LABEL.get(m, m),
+                               "avg": sum(v for _, v, _ in scores[m]) / len(scores[m]),
+                               "passed": sum(1 for *_, ok in scores[m] if ok),
+                               "failed": sum(1 for *_, ok in scores[m] if not ok)} for m in names],
+                             key=run.run_id)
 
     ui.section("Code checks")
     turns = [t for c in cases.values() for t in c.get("turns", [])]
@@ -222,17 +219,33 @@ def chat_overview(run: D.Run) -> None:
         ui.card("Governance clean", f"{gov_ok}/{len(turns)}", "no real names / sensitive values reached the AI",
                 bad=gov_ok < len(turns))
 
-    scores = D.chat_metric_scores(cases)
     if scores:
         ui.section("Eval metrics")
-        names = [m for m in D.TURN_METRICS + D.CONV_METRICS if m in scores]
-        for i in range(0, len(names), 2):
-            cols = st.columns(2)
-            for j, m in enumerate(names[i:i + 2]):
-                with cols[j]:
-                    with st.container(border=True):
-                        ui.histogram(D.METRIC_LABEL.get(m, m), [v for _, v, _ in scores[m]],
-                                     ui.METRIC_COLORS[(i + j) % len(ui.METRIC_COLORS)])
+        ui.eval_metrics(chat_metric_frame(cases, statuses), ["Case type", "Status", "Data check"], key=run.run_id)
+
+
+def chat_metric_frame(cases: dict, statuses: dict) -> pd.DataFrame:
+    """One row per judge result, with the keys the Eval metrics charts can group by."""
+    rows = []
+    for cid, rec in cases.items():
+        kind = rec.get("kind", "")
+        for t in rec.get("turns", []):
+            data = t["checks"][0]["passed"] if t.get("match") != "none" and t.get("checks") else None
+            for m, v in (t.get("judge") or {}).items():
+                if v and v.get("score") is not None:
+                    rows.append({"metric": D.METRIC_LABEL.get(m, m), "score": v["score"], "passed": bool(D.metric_ok(v)),
+                                 "case": t["name"], "Case type": kind, "Status": statuses[cid],
+                                 "Data check": "-" if data is None else ("PASS" if data else "FAIL")})
+        for m, v in (rec.get("conversation_judge") or {}).items():
+            if v and v.get("score") is not None:
+                rows.append({"metric": D.METRIC_LABEL.get(m, m), "score": v["score"], "passed": bool(D.metric_ok(v)),
+                             "case": cid, "Case type": kind, "Status": statuses[cid], "Data check": "-"})
+    order = [D.METRIC_LABEL[m] for m in D.TURN_METRICS + D.CONV_METRICS]
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["_o"] = df["metric"].map(lambda x: order.index(x) if x in order else 99)
+        df = df.sort_values("_o").drop(columns="_o")
+    return df
 
 
 def chat_cases(run: D.Run) -> None:
@@ -242,11 +255,10 @@ def chat_cases(run: D.Run) -> None:
         return
     statuses = {cid: D.chat_case_status(c) for cid, c in cases.items()}
     n_pass = sum(1 for v in statuses.values() if v == "Passed")
-    c1, c2 = st.columns([3, 2])
+    c1, c2 = st.columns([2, 3])
     flt = c1.segmented_control("Show", ["All", "Passed", "Failed"], default="All", key=f"flt_{run.run_id}")
-    c2.markdown(f"{ui.badge('PASSED', 'pass')} **{100 * n_pass / len(cases):.0f}%** · {n_pass}/{len(cases)} &nbsp; "
-                f"{ui.badge('FAILED', 'fail')} **{100 * (len(cases) - n_pass) / len(cases):.0f}%** · "
-                f"{len(cases) - n_pass}/{len(cases)}", unsafe_allow_html=True)
+    with c2:
+        ui.pass_summary(n_pass, len(cases))
 
     def avg(rec, metric):
         vals = [t["judge"][metric]["score"] for t in rec.get("turns", [])
@@ -353,14 +365,17 @@ def chat_case_details(rec: dict, status: str) -> None:
 def metric_block(name: str, v: dict) -> None:
     ok = D.metric_ok(v)
     status = "Errored" if v.get("error") else ("Success" if ok else "Failed")
-    with st.expander(f"{D.METRIC_LABEL.get(name, name)} · {status} · {ui.fmt_score(v.get('score'))}", expanded=not ok):
-        st.markdown(f"{ui.status_badge(status)}", unsafe_allow_html=True)
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Score", ui.fmt_score(v.get("score")))
-        c2.metric("Threshold", f"{D.THRESHOLD}")
-        c3.markdown(f"<div class='nv-meta'>Evaluation model<br><b>{D.judge_model_name()} (Anthropic)</b></div>",
+    with st.expander(f"{D.METRIC_LABEL.get(name, name)}  ·  {status}  ·  {ui.fmt_score(v.get('score'))}",
+                     expanded=True):
+        def field(label: str, value: str) -> str:
+            return (f"<div style='color:{ui.MUTED};font-size:0.82rem'>{label}</div>"
+                    f"<div style='color:{ui.TEXT};font-size:1rem;margin-bottom:12px'>{value}</div>")
+        c1, c2 = st.columns(2)
+        c1.markdown(field("Status", ui.status_badge(status)) + field("Score", ui.fmt_score(v.get("score"))),
                     unsafe_allow_html=True)
-        st.markdown("**Reason**")
+        c2.markdown(field("Evaluation Model", f"{D.judge_model_name()} (Anthropic)")
+                    + field("Threshold", f"{D.THRESHOLD}"), unsafe_allow_html=True)
+        st.markdown(f"<div style='color:{ui.MUTED};font-size:0.82rem'>Reason</div>", unsafe_allow_html=True)
         st.write(v.get("reason") or "-")
         if v.get("error"):
             st.error(v["error"])
@@ -633,6 +648,7 @@ def expected_answers(dataset: str, sqls: tuple[str, ...], csv_mtime: float) -> d
 
 
 def validate_golden(kind: str, text: str) -> list[str]:
+    """Check one golden file (chat.yaml or tools.yaml)."""
     try:
         doc = yaml.safe_load(text)
     except yaml.YAMLError as exc:
@@ -640,6 +656,10 @@ def validate_golden(kind: str, text: str) -> list[str]:
     cases = (doc or {}).get("cases")
     if not isinstance(cases, list) or not cases:
         return ["The file needs a top-level 'cases:' list with at least one case."]
+    return validate_section(kind, cases)
+
+
+def validate_section(kind: str, cases: list) -> list[str]:
     problems, seen = [], set()
     for i, c in enumerate(cases, 1):
         cid = c.get("id") if isinstance(c, dict) else None
@@ -687,19 +707,19 @@ def page_goldens() -> None:
     csv = Path(ds.reference_file) if ds.reference_file else None
     st.markdown(f"<span class='nv-meta'>Source <b>{ds.source_id}</b> in tenant <b>{ds.tenant_slug}</b> · "
                 f"answer key <b>{csv}</b></span>", unsafe_allow_html=True)
-    tab_chat, tab_tools = st.tabs(["Chat questions", "Tools tests"])
+    tab_chat, tab_tools = st.tabs(["Chat questions (chat.yaml)", "Tools tests (tools.yaml)"])
     for kind, tab in (("chat", tab_chat), ("tools", tab_tools)):
         with tab:
-            golden_editor(ds, dataset, kind, csv)
+            if not D.golden_path(dataset, kind).exists():
+                st.info(f"No {kind}.yaml yet for this dataset.")
+                continue
+            golden_list(dataset, kind, csv)
+            golden_file_editor(dataset, kind)
 
 
-def golden_editor(ds, dataset: str, kind: str, csv: Path | None) -> None:
+def golden_list(dataset: str, kind: str, csv: Path | None) -> None:
     path = D.golden_path(dataset, kind)
-    if not path.exists():
-        st.info(f"No {path.name} yet for this dataset.")
-        return
-    text = path.read_text(encoding="utf-8")
-    doc = yaml.safe_load(text) or {}
+    doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     cases = doc.get("cases") or []
     rows = []
     sqls: list[str] = []
@@ -743,9 +763,12 @@ def golden_editor(ds, dataset: str, kind: str, csv: Path | None) -> None:
                     else:
                         st.caption(f"Expectation: {c.get('expect')}")
 
+def golden_file_editor(dataset: str, kind: str) -> None:
+    path = D.golden_path(dataset, kind)
+    text = path.read_text(encoding="utf-8")
     with st.expander(f"Edit {path.name}"):
-        st.caption("Edit the YAML, press Validate, then Save. The previous version is kept in goldens/.history/.")
-        new = st.text_area("YAML", text, height=480, key=f"yaml_{dataset}_{kind}", label_visibility="collapsed")
+        st.caption("Edit the YAML, press Validate, then Save.")
+        new = st.text_area("YAML", text, height=520, key=f"yaml_{dataset}_{kind}", label_visibility="collapsed")
         b1, b2, _ = st.columns([1, 1, 6])
         if b1.button("Validate", key=f"val_{dataset}_{kind}"):
             problems = validate_golden(kind, new)
@@ -760,12 +783,9 @@ def golden_editor(ds, dataset: str, kind: str, csv: Path | None) -> None:
             elif new == text:
                 st.info("No changes.")
             else:
-                hist = path.parent / ".history"
-                hist.mkdir(exist_ok=True)
-                (hist / f"{path.stem}.{datetime.now():%Y%m%d-%H%M%S}.yaml").write_text(text, encoding="utf-8")
                 path.write_text(new, encoding="utf-8")
                 st.cache_data.clear()
-                st.success(f"Saved. Previous version kept in {hist.name}/.")
+                st.success("Saved.")
                 st.rerun()
 
 

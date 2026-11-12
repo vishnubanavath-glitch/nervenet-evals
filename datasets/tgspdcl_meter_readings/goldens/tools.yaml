@@ -1,25 +1,27 @@
-# Tools golden cases: MCP tools called directly (no LLM).
+# =================================================================================================
+# TOOLS GOLDEN TESTS - TGSPDCL meter readings (MySQL source "tgspdcl", table meter_readings)
+# Used by the tools evaluation (scripts/eval_tools.py): MCP tools called directly, no AI.
+# Expected results for match_reference / kpi_matches are calculated from the reference CSV at run time.
+# =================================================================================================
 #
-# Placeholders: {t:<real table>} and {c:<real column>}.
-#   - sent to the MCP server as the anonymized tokens (tbl_1, col_36, ...)
-#   - run on the reference CSV (DuckDB) with the real names, to get the expected answer
-# {source} = the dataset's source_id.
-# {o:<source_id>:<table>} = a table token from ANOTHER source (isolation tests).
-#
-# expect:
-#   match_reference   rows equal the same SQL on the reference CSV (numbers within 1e-6 relative)
-#   rejected          the tool refuses (ok=false); the error must not contain real names
-#   row_limit         exactly `rows` rows come back and `truncated` is true
-#   capped            fewer rows than `limit` come back (a server-side cap applied) and truncated is true
-#   masked            the tool output contains no real table/column names
-#   masked_headers    result column headers contain no real names
-#   kpi_matches       kpi_summary[<column>] count/min/max/sum equal the reference
-#   not_listed        discover (no args) does not list the given source_id
-# user: test-user label from dataset.toml (default full_access). Cases for a user that
-#       is not configured are skipped.
+#   id, area, title, notes
+#   sql                with {t:table} / {c:column}: sent masked to the app, run with real names on the CSV
+#   raw_sql            sent exactly as written;  raw_sql_template: as written, placeholders filled
+#   tool + args        call a tool directly (e.g. discover) with these arguments
+#   query_source       source_id to query (default: this dataset's source)
+#   limit              row limit sent with the query
+#   {source} = this dataset's source_id;  {o:<source_id>:<table>} = a table token from another source
+#   expect: match_reference | rejected | masked | masked_headers | row_limit (+ rows) | capped
+#           | kpi_matches (+ kpi_column) | not_listed (+ other_source)
+#   user: test-user label from dataset.toml (default full_access)
+# =================================================================================================
 
 cases:
-  # --- Results: masked SQL gives the same answers as the real data ----------------------
+
+  # ================================================================================================
+  # CORRECT NUMBERS - masked SQL on MySQL must equal the same SQL on the CSV   [88 tests]
+  # ================================================================================================
+
   - id: R01
     area: results
     title: Total number of records
@@ -159,7 +161,549 @@ cases:
       FROM {t:meter_readings} GROUP BY {c:meter_phase} ORDER BY phase
     expect: match_reference
 
-  # --- Naming: no real names leave the tools --------------------------------------------
+  - id: R19
+    area: results
+    title: Billed readings
+    sql: SELECT COUNT(*) AS n FROM {t:meter_readings} WHERE {c:billflag} = 'S'
+    expect: match_reference
+
+  - id: R20
+    area: results
+    title: Unbilled readings without a reading date
+    sql: SELECT COUNT(*) AS n FROM {t:meter_readings} WHERE {c:billflag} = 'U' AND {c:readingdate} IS NULL
+    expect: match_reference
+
+  - id: R21
+    area: results
+    title: Net billed units per reading month
+    sql: >
+      SELECT SUBSTRING({c:readingdate}, 4, 7) AS m, SUM({c:netbilled_units}) AS u FROM {t:meter_readings}
+      WHERE {c:readingdate} IS NOT NULL GROUP BY SUBSTRING({c:readingdate}, 4, 7)
+    expect: match_reference
+
+  - id: R22
+    area: results
+    title: Average bill per sub-division (rounded)
+    sql: >
+      SELECT UPPER({c:subdivname}) AS s, ROUND(AVG({c:billamount}), 2) AS a FROM {t:meter_readings}
+      GROUP BY UPPER({c:subdivname})
+    expect: match_reference
+
+  - id: R23
+    area: results
+    title: Distinct service connections per sub-division
+    sql: >
+      SELECT UPPER({c:subdivname}) AS s, COUNT(DISTINCT {c:service_number}) AS n FROM {t:meter_readings}
+      GROUP BY UPPER({c:subdivname})
+    expect: match_reference
+
+  - id: R24
+    area: results
+    title: Lowest and highest bill per section
+    sql: >
+      SELECT UPPER({c:secname}) AS s, MIN({c:billamount}) AS lo, MAX({c:billamount}) AS hi FROM {t:meter_readings}
+      GROUP BY UPPER({c:secname})
+    expect: match_reference
+
+  - id: R25
+    area: results
+    title: Total old and new arrears
+    sql: SELECT SUM({c:old_arrears}) AS o, SUM({c:new_arrears}) AS n FROM {t:meter_readings}
+    expect: match_reference
+
+  - id: R26
+    area: results
+    title: Readings where new arrears exceed old arrears
+    sql: SELECT COUNT(*) AS n FROM {t:meter_readings} WHERE {c:new_arrears} > {c:old_arrears}
+    expect: match_reference
+
+  - id: R27
+    area: results
+    title: Readings per ERO (case-insensitive, merges the spelling variant)
+    sql: >
+      SELECT UPPER({c:eroname}) AS e, COUNT(*) AS n FROM {t:meter_readings} GROUP BY UPPER({c:eroname})
+    expect: match_reference
+
+  - id: R28
+    area: results
+    title: Readings per tariff category
+    sql: >
+      SELECT UPPER({c:tariffcat}) AS t, COUNT(*) AS n FROM {t:meter_readings} WHERE {c:tariffcat} IS NOT NULL
+      GROUP BY UPPER({c:tariffcat})
+    expect: match_reference
+
+  - id: R29
+    area: results
+    title: Readings and average bill per consumer category
+    sql: >
+      SELECT {c:category} AS c, COUNT(*) AS n, ROUND(AVG({c:billamount}), 2) AS a FROM {t:meter_readings}
+      WHERE {c:category} IS NOT NULL GROUP BY {c:category}
+    expect: match_reference
+
+  - id: R30
+    area: results
+    title: Net billed units per meter phase
+    sql: >
+      SELECT {c:meter_phase} AS p, SUM({c:netbilled_units}) AS u FROM {t:meter_readings}
+      WHERE {c:meter_phase} IS NOT NULL GROUP BY {c:meter_phase}
+    expect: match_reference
+
+  - id: R31
+    area: results
+    title: Readings per subsidy flag
+    sql: >
+      SELECT {c:subsidy_flag} AS f, COUNT(*) AS n FROM {t:meter_readings} WHERE {c:subsidy_flag} IS NOT NULL
+      GROUP BY {c:subsidy_flag}
+    expect: match_reference
+
+  - id: R32
+    area: results
+    title: Readings per Gruha Jyothi flag
+    sql: SELECT UPPER({c:gj_flag}) AS g, COUNT(*) AS n FROM {t:meter_readings} GROUP BY UPPER({c:gj_flag})
+    expect: match_reference
+
+  - id: R33
+    area: results
+    title: Readings per Gruha Jyothi billed flag
+    sql: >
+      SELECT {c:gjbilledflag} AS f, COUNT(*) AS n FROM {t:meter_readings} WHERE {c:gjbilledflag} IS NOT NULL
+      GROUP BY {c:gjbilledflag}
+    expect: match_reference
+
+  - id: R34
+    area: results
+    title: Readings per scan mode
+    sql: >
+      SELECT UPPER({c:scanmode}) AS m, COUNT(*) AS n FROM {t:meter_readings} WHERE {c:scanmode} IS NOT NULL
+      GROUP BY UPPER({c:scanmode})
+    expect: match_reference
+
+  - id: R35
+    area: results
+    title: Readings per IRDA flag
+    sql: >
+      SELECT {c:irda_flag} AS f, COUNT(*) AS n FROM {t:meter_readings} WHERE {c:irda_flag} IS NOT NULL
+      GROUP BY {c:irda_flag}
+    expect: match_reference
+
+  - id: R36
+    area: results
+    title: Readings per matched source
+    sql: >
+      SELECT UPPER({c:matched_source}) AS s, COUNT(*) AS n FROM {t:meter_readings} WHERE {c:matched_source} IS NOT NULL
+      GROUP BY UPPER({c:matched_source})
+    expect: match_reference
+
+  - id: R37
+    area: results
+    title: Readings per reading type
+    sql: >
+      SELECT UPPER({c:readingtype}) AS r, COUNT(*) AS n FROM {t:meter_readings} WHERE {c:readingtype} IS NOT NULL
+      GROUP BY UPPER({c:readingtype})
+    expect: match_reference
+
+  - id: R38
+    area: results
+    title: Readings per analysis remark
+    sql: >
+      SELECT UPPER({c:analysisremark}) AS r, COUNT(*) AS n FROM {t:meter_readings} WHERE {c:analysisremark} IS NOT NULL
+      GROUP BY UPPER({c:analysisremark})
+    expect: match_reference
+
+  - id: R39
+    area: results
+    title: Readings per day in June 2026
+    sql: >
+      SELECT LEFT({c:readingdate}, 10) AS d, COUNT(*) AS n FROM {t:meter_readings}
+      WHERE SUBSTRING({c:readingdate}, 4, 7) = '06-2026' GROUP BY LEFT({c:readingdate}, 10)
+    expect: match_reference
+
+  - id: R40
+    area: results
+    title: Readings per last-payment year
+    sql: >
+      SELECT RIGHT({c:last_paid_date}, 4) AS y, COUNT(*) AS n FROM {t:meter_readings}
+      WHERE {c:last_paid_date} IS NOT NULL GROUP BY RIGHT({c:last_paid_date}, 4)
+    expect: match_reference
+
+  - id: R41
+    area: results
+    title: Readings per previous-reading month
+    sql: >
+      SELECT SUBSTRING({c:previous_reading_date}, 4, 7) AS m, COUNT(*) AS n FROM {t:meter_readings}
+      WHERE {c:previous_reading_date} IS NOT NULL GROUP BY SUBSTRING({c:previous_reading_date}, 4, 7)
+    expect: match_reference
+
+  - id: R42
+    area: results
+    title: Readings per contracted-load band (CASE)
+    sql: >
+      SELECT CASE WHEN {c:contracted_load} < 1 THEN 'a <1' WHEN {c:contracted_load} < 2 THEN 'b 1-2'
+                  WHEN {c:contracted_load} < 5 THEN 'c 2-5' ELSE 'd 5+' END AS band, COUNT(*) AS n
+      FROM {t:meter_readings} WHERE {c:contracted_load} IS NOT NULL GROUP BY band
+    expect: match_reference
+
+  - id: R43
+    area: results
+    title: Billed readings per bill band (CASE)
+    sql: >
+      SELECT CASE WHEN {c:billamount} < 500 THEN 'a <500' WHEN {c:billamount} <= 2000 THEN 'b 500-2000'
+                  WHEN {c:billamount} <= 5000 THEN 'c 2000-5000' ELSE 'd 5000+' END AS band, COUNT(*) AS n
+      FROM {t:meter_readings} WHERE {c:billamount} IS NOT NULL GROUP BY band
+    expect: match_reference
+
+  - id: R44
+    area: results
+    title: Readings with more than 40 billing days
+    sql: SELECT COUNT(*) AS n FROM {t:meter_readings} WHERE {c:spotbilldays} > 40
+    expect: match_reference
+
+  - id: R45
+    area: results
+    title: Average billing days per sub-division (rounded)
+    sql: >
+      SELECT UPPER({c:subdivname}) AS s, ROUND(AVG({c:spotbilldays}), 2) AS d FROM {t:meter_readings}
+      GROUP BY UPPER({c:subdivname})
+    expect: match_reference
+
+  - id: R46
+    area: results
+    title: Bill per unit per tariff category (rounded ratio)
+    sql: >
+      SELECT UPPER({c:tariffcat}) AS t, ROUND(SUM({c:billamount}) / SUM({c:netbilled_units}), 2) AS r
+      FROM {t:meter_readings} WHERE {c:tariffcat} IS NOT NULL GROUP BY UPPER({c:tariffcat})
+    expect: match_reference
+
+  - id: R47
+    area: results
+    title: Readings where the present reading is below the previous reading
+    sql: SELECT COUNT(*) AS n FROM {t:meter_readings} WHERE {c:presentreading} < {c:previous_kwh_reading}
+    expect: match_reference
+
+  - id: R48
+    area: results
+    title: Total consumption (present minus previous) on billed readings
+    sql: >
+      SELECT SUM({c:presentreading} - {c:previous_kwh_reading}) AS c FROM {t:meter_readings} WHERE {c:billflag} = 'S'
+    expect: match_reference
+
+  - id: R49
+    area: results
+    title: Readings whose consumption matches net billed units within 1 unit
+    sql: >
+      SELECT COUNT(*) AS n FROM {t:meter_readings}
+      WHERE ABS(({c:presentreading} - {c:previous_kwh_reading}) - {c:netbilled_units}) < 1
+    expect: match_reference
+
+  - id: R50
+    area: results
+    title: HAVING - sections with more than 40,000 readings
+    sql: >
+      SELECT UPPER({c:secname}) AS s, COUNT(*) AS n FROM {t:meter_readings} GROUP BY UPPER({c:secname})
+      HAVING COUNT(*) > 40000
+    expect: match_reference
+
+  - id: R51
+    area: results
+    title: Top 5 sections by bill amount (with tie-breaker)
+    sql: >
+      SELECT UPPER({c:secname}) AS s, SUM({c:billamount}) AS b FROM {t:meter_readings} GROUP BY UPPER({c:secname})
+      ORDER BY b DESC, s LIMIT 5
+    expect: match_reference
+
+  - id: R52
+    area: results
+    title: Bottom 3 tariff categories by readings (with tie-breaker)
+    sql: >
+      SELECT UPPER({c:tariffcat}) AS t, COUNT(*) AS n FROM {t:meter_readings} WHERE {c:tariffcat} IS NOT NULL
+      GROUP BY UPPER({c:tariffcat}) ORDER BY n, t LIMIT 3
+    expect: match_reference
+
+  - id: R53
+    area: results
+    title: ROW_NUMBER - top section by bill in each sub-division
+    sql: >
+      WITH t AS (SELECT UPPER({c:subdivname}) AS d, UPPER({c:secname}) AS s, SUM({c:billamount}) AS b,
+                 ROW_NUMBER() OVER (PARTITION BY UPPER({c:subdivname}) ORDER BY SUM({c:billamount}) DESC) AS rn
+                 FROM {t:meter_readings} GROUP BY UPPER({c:subdivname}), UPPER({c:secname}))
+      SELECT d, s, b FROM t WHERE rn = 1
+    expect: match_reference
+
+  - id: R54
+    area: results
+    title: RANK - sections ranked by bill amount
+    sql: >
+      SELECT UPPER({c:secname}) AS s, SUM({c:billamount}) AS b, RANK() OVER (ORDER BY SUM({c:billamount}) DESC) AS r
+      FROM {t:meter_readings} GROUP BY UPPER({c:secname})
+    expect: match_reference
+
+  - id: R55
+    area: results
+    title: SUM() OVER () - each sub-division's share of the bill (rounded)
+    sql: >
+      SELECT UPPER({c:subdivname}) AS s,
+             ROUND(100 * SUM({c:billamount}) / SUM(SUM({c:billamount})) OVER (), 2) AS pct
+      FROM {t:meter_readings} GROUP BY UPPER({c:subdivname})
+    expect: match_reference
+
+  - id: R56
+    area: results
+    title: Running total of readings per day in June 2026
+    sql: >
+      SELECT LEFT({c:readingdate}, 10) AS d, COUNT(*) AS n,
+             SUM(COUNT(*)) OVER (ORDER BY LEFT({c:readingdate}, 10)) AS running
+      FROM {t:meter_readings} WHERE SUBSTRING({c:readingdate}, 4, 7) = '06-2026' GROUP BY LEFT({c:readingdate}, 10)
+    expect: match_reference
+
+  - id: R57
+    area: results
+    title: Connections billed in both April and June 2026 (pivot per connection)
+    sql: >
+      SELECT COUNT(*) AS n FROM (SELECT {c:service_number} AS sn,
+        MAX(CASE WHEN SUBSTRING({c:readingdate}, 4, 7) = '04-2026' AND {c:billflag} = 'S' THEN 1 ELSE 0 END) AS a,
+        MAX(CASE WHEN SUBSTRING({c:readingdate}, 4, 7) = '06-2026' AND {c:billflag} = 'S' THEN 1 ELSE 0 END) AS j
+        FROM {t:meter_readings} GROUP BY {c:service_number}) x WHERE a = 1 AND j = 1
+    expect: match_reference
+
+  - id: R58
+    area: results
+    title: Connections billed in April but not in June 2026
+    sql: >
+      SELECT COUNT(*) AS n FROM (SELECT {c:service_number} AS sn,
+        MAX(CASE WHEN SUBSTRING({c:readingdate}, 4, 7) = '04-2026' AND {c:billflag} = 'S' THEN 1 ELSE 0 END) AS a,
+        MAX(CASE WHEN SUBSTRING({c:readingdate}, 4, 7) = '06-2026' AND {c:billflag} = 'S' THEN 1 ELSE 0 END) AS j
+        FROM {t:meter_readings} GROUP BY {c:service_number}) x WHERE a = 1 AND j = 0
+    expect: match_reference
+
+  - id: R59
+    area: results
+    title: Average bill change April to June for connections billed in both (rounded)
+    sql: >
+      SELECT ROUND(AVG(j - a), 2) AS avg_change FROM (SELECT {c:service_number} AS sn,
+        SUM(CASE WHEN SUBSTRING({c:readingdate}, 4, 7) = '04-2026' AND {c:billflag} = 'S' THEN {c:billamount} END) AS a,
+        SUM(CASE WHEN SUBSTRING({c:readingdate}, 4, 7) = '06-2026' AND {c:billflag} = 'S' THEN {c:billamount} END) AS j
+        FROM {t:meter_readings} GROUP BY {c:service_number}) x WHERE a IS NOT NULL AND j IS NOT NULL
+    expect: match_reference
+
+  - id: R60
+    area: results
+    title: Distinct meter numbers (normalised)
+    sql: SELECT COUNT(DISTINCT UPPER(TRIM({c:meter_number}))) AS n FROM {t:meter_readings}
+    expect: match_reference
+
+  - id: R61
+    area: results
+    title: Meter numbers shared by more than one connection
+    sql: >
+      SELECT COUNT(*) AS n FROM (SELECT UPPER(TRIM({c:meter_number})) AS m FROM {t:meter_readings}
+      GROUP BY UPPER(TRIM({c:meter_number})) HAVING COUNT(DISTINCT {c:service_number}) > 1) x
+    expect: match_reference
+
+  - id: R62
+    area: results
+    title: Readings with meter numbers corrupted into scientific notation
+    sql: SELECT COUNT(*) AS n FROM {t:meter_readings} WHERE UPPER({c:meter_number}) LIKE '%E+%'
+    expect: match_reference
+
+  - id: R63
+    area: results
+    title: Distinct distribution transformers
+    sql: SELECT COUNT(DISTINCT {c:dtrcode}) AS n FROM {t:meter_readings}
+    expect: match_reference
+
+  - id: R64
+    area: results
+    title: COALESCE - readings per scan mode with blanks labelled
+    sql: >
+      SELECT COALESCE(UPPER({c:scanmode}), 'NONE') AS m, COUNT(*) AS n FROM {t:meter_readings}
+      GROUP BY COALESCE(UPPER({c:scanmode}), 'NONE')
+    expect: match_reference
+
+  - id: R65
+    area: results
+    title: NULLIF - overall bill per unit (rounded)
+    sql: >
+      SELECT ROUND(SUM({c:billamount}) / NULLIF(SUM({c:netbilled_units}), 0), 2) AS r FROM {t:meter_readings}
+    expect: match_reference
+
+  - id: R66
+    area: results
+    title: BETWEEN - bills from 1,000 to 2,000
+    sql: SELECT COUNT(*) AS n FROM {t:meter_readings} WHERE {c:billamount} BETWEEN 1000 AND 2000
+    expect: match_reference
+
+  - id: R67
+    area: results
+    title: IN list - readings in two sections
+    sql: >
+      SELECT UPPER({c:secname}) AS s, COUNT(*) AS n FROM {t:meter_readings}
+      WHERE UPPER({c:secname}) IN ('KOMPALLY', 'ALIABAD') GROUP BY UPPER({c:secname})
+    expect: match_reference
+
+  - id: R68
+    area: results
+    title: Connections with a June reading but no April reading
+    sql: >
+      SELECT COUNT(*) AS n FROM (SELECT {c:service_number} AS sn,
+        MAX(CASE WHEN SUBSTRING({c:readingdate}, 4, 7) = '04-2026' THEN 1 ELSE 0 END) AS a,
+        MAX(CASE WHEN SUBSTRING({c:readingdate}, 4, 7) = '06-2026' THEN 1 ELSE 0 END) AS j
+        FROM {t:meter_readings} GROUP BY {c:service_number}) x WHERE j = 1 AND a = 0
+    expect: match_reference
+
+  - id: R69
+    area: results
+    title: Connections with both a billed and an unbilled reading
+    sql: >
+      SELECT COUNT(*) AS n FROM (SELECT {c:service_number} AS sn FROM {t:meter_readings} GROUP BY {c:service_number}
+      HAVING SUM(CASE WHEN {c:billflag} = 'S' THEN 1 ELSE 0 END) > 0
+         AND SUM(CASE WHEN {c:billflag} = 'U' THEN 1 ELSE 0 END) > 0) x
+    expect: match_reference
+
+  - id: R70
+    area: results
+    title: UNION ALL - billed and unbilled counts as two rows
+    sql: >
+      SELECT 'billed' AS k, COUNT(*) AS n FROM {t:meter_readings} WHERE {c:billflag} = 'S'
+      UNION ALL SELECT 'unbilled' AS k, COUNT(*) AS n FROM {t:meter_readings} WHERE {c:billflag} = 'U'
+    expect: match_reference
+
+  - id: R71
+    area: results
+    title: Pivot - billed and unbilled per month
+    sql: >
+      SELECT SUBSTRING({c:readingdate}, 4, 7) AS m,
+             SUM(CASE WHEN {c:billflag} = 'S' THEN 1 ELSE 0 END) AS billed,
+             SUM(CASE WHEN {c:billflag} = 'U' THEN 1 ELSE 0 END) AS unbilled
+      FROM {t:meter_readings} WHERE {c:readingdate} IS NOT NULL GROUP BY SUBSTRING({c:readingdate}, 4, 7)
+    expect: match_reference
+
+  - id: R72
+    area: results
+    title: Sections per sub-division
+    sql: >
+      SELECT UPPER({c:subdivname}) AS d, COUNT(DISTINCT UPPER({c:secname})) AS n FROM {t:meter_readings}
+      GROUP BY UPPER({c:subdivname})
+    expect: match_reference
+
+  - id: R73
+    area: results
+    title: Distinct consumer names (normalised)
+    sql: SELECT COUNT(DISTINCT UPPER(TRIM({c:name}))) AS n FROM {t:meter_readings}
+    expect: match_reference
+
+  - id: R74
+    area: results
+    title: Distinct section names after trimming
+    sql: SELECT COUNT(DISTINCT UPPER(TRIM({c:secname}))) AS n FROM {t:meter_readings}
+    expect: match_reference
+
+  - id: R75
+    area: results
+    title: Unbilled percentage per section (rounded)
+    sql: >
+      SELECT UPPER({c:secname}) AS s,
+             ROUND(100 * SUM(CASE WHEN {c:billflag} = 'U' THEN 1 ELSE 0 END) / COUNT(*), 2) AS pct
+      FROM {t:meter_readings} GROUP BY UPPER({c:secname})
+    expect: match_reference
+
+  - id: R76
+    area: results
+    title: Nested aggregate - average of section bill totals (rounded)
+    sql: >
+      SELECT ROUND(AVG(b), 2) AS a FROM (SELECT UPPER({c:secname}) AS s, SUM({c:billamount}) AS b
+      FROM {t:meter_readings} GROUP BY UPPER({c:secname})) x
+    expect: match_reference
+
+  - id: R77
+    area: results
+    title: Sum of negative bill amounts
+    sql: >
+      SELECT SUM(CASE WHEN {c:billamount} < 0 THEN {c:billamount} ELSE 0 END) AS neg FROM {t:meter_readings}
+    expect: match_reference
+
+  - id: R78
+    area: results
+    title: Distinct reading days
+    sql: SELECT COUNT(DISTINCT LEFT({c:readingdate}, 10)) AS n FROM {t:meter_readings}
+    expect: match_reference
+
+  - id: R79
+    area: results
+    title: Bill amount per sub-division and month
+    sql: >
+      SELECT UPPER({c:subdivname}) AS d, SUBSTRING({c:readingdate}, 4, 7) AS m, SUM({c:billamount}) AS b
+      FROM {t:meter_readings} WHERE {c:readingdate} IS NOT NULL
+      GROUP BY UPPER({c:subdivname}), SUBSTRING({c:readingdate}, 4, 7)
+    expect: match_reference
+
+  - id: R80
+    area: results
+    title: Distinct sub-division and section pairs
+    sql: >
+      SELECT DISTINCT UPPER({c:subdivname}) AS d, UPPER({c:secname}) AS s FROM {t:meter_readings}
+    expect: match_reference
+
+  - id: R81
+    area: results
+    title: Highest single bill and its connection
+    sql: >
+      SELECT {c:service_number} AS sn, {c:billamount} AS b FROM {t:meter_readings} WHERE {c:billamount} IS NOT NULL
+      ORDER BY {c:billamount} DESC, {c:service_number} LIMIT 1
+    expect: match_reference
+
+  - id: R82
+    area: results
+    title: Readings with no consumer name
+    sql: SELECT COUNT(*) AS n FROM {t:meter_readings} WHERE {c:name} IS NULL
+    expect: match_reference
+
+  - id: R83
+    area: results
+    title: Average contracted load per meter phase (rounded)
+    sql: >
+      SELECT {c:meter_phase} AS p, ROUND(AVG({c:contracted_load}), 2) AS l FROM {t:meter_readings}
+      WHERE {c:meter_phase} IS NOT NULL GROUP BY {c:meter_phase}
+    expect: match_reference
+
+  - id: R84
+    area: results
+    title: Readings where spot maximum demand exceeds contracted load
+    sql: SELECT COUNT(*) AS n FROM {t:meter_readings} WHERE {c:spotmd} > {c:contracted_load}
+    expect: match_reference
+
+  - id: R85
+    area: results
+    title: Total payable minus total bill
+    sql: SELECT SUM({c:totalamount}) - SUM({c:billamount}) AS d FROM {t:meter_readings}
+    expect: match_reference
+
+  - id: R86
+    area: results
+    title: Billed readings where total payable is below the bill
+    sql: >
+      SELECT COUNT(*) AS n FROM {t:meter_readings} WHERE {c:billflag} = 'S' AND {c:totalamount} < {c:billamount}
+    expect: match_reference
+
+  - id: R87
+    area: results
+    title: Mobile numbers linked to more than 5 connections
+    sql: >
+      SELECT COUNT(*) AS n FROM (SELECT {c:mobile_number} AS m FROM {t:meter_readings} WHERE {c:mobile_number} IS NOT NULL
+      GROUP BY {c:mobile_number} HAVING COUNT(DISTINCT {c:service_number}) > 5) x
+    expect: match_reference
+
+  - id: R88
+    area: results
+    title: Gruha Jyothi readings that got the subsidy while using over 200 units
+    sql: >
+      SELECT COUNT(*) AS n FROM {t:meter_readings} WHERE UPPER({c:gj_flag}) = 'YES' AND {c:gjbilledflag} = 1
+      AND {c:netbilled_units} > 200
+    expect: match_reference
+
+  # ================================================================================================
+  # REAL NAMES HIDDEN - headers, discover output, error messages, real names in SQL   [33 tests]
+  # ================================================================================================
+
   - id: N01
     area: naming
     title: Result headers for un-aliased columns are masked
@@ -213,7 +757,184 @@ cases:
     sql: SELECT {c:subdivname} AS s, SUM({c:billamount}) AS b FROM {t:meter_readings} GROUP BY {c:subdivname}
     expect: masked
 
-  # --- Row limits -------------------------------------------------------------------------
+  - id: N09
+    area: naming
+    title: Un-aliased aggregate header is masked
+    sql: SELECT {c:secname}, SUM({c:billamount}) FROM {t:meter_readings} GROUP BY {c:secname}
+    expect: masked_headers
+
+  - id: N10
+    area: naming
+    title: DISTINCT column header is masked
+    sql: SELECT DISTINCT {c:tariffcat} FROM {t:meter_readings}
+    expect: masked_headers
+
+  - id: N11
+    area: naming
+    title: Window-function header without alias is masked
+    sql: >
+      SELECT {c:secname}, RANK() OVER (ORDER BY COUNT(*) DESC) FROM {t:meter_readings} GROUP BY {c:secname}
+    expect: masked_headers
+
+  - id: N12
+    area: naming
+    title: Several plain columns keep masked headers
+    sql: >
+      SELECT {c:subdivname}, {c:secname}, COUNT(*) FROM {t:meter_readings} GROUP BY {c:subdivname}, {c:secname}
+    expect: masked_headers
+
+  - id: N13
+    area: naming
+    title: Table-alias column headers are masked
+    sql: SELECT t.{c:secname}, t.{c:billamount} FROM {t:meter_readings} t LIMIT 3
+    expect: masked_headers
+
+  - id: N14
+    area: naming
+    title: Arithmetic expression header is masked
+    sql: SELECT SUM({c:billamount}) / COUNT(*) FROM {t:meter_readings}
+    expect: masked_headers
+
+  - id: N15
+    area: naming
+    title: CTE query output (executed SQL etc.) is masked
+    sql: >
+      WITH x AS (SELECT {c:secname} AS s, SUM({c:billamount}) AS b FROM {t:meter_readings} GROUP BY {c:secname})
+      SELECT s, b FROM x
+    expect: masked
+
+  - id: N16
+    area: naming
+    title: Window-function query output is masked
+    sql: >
+      SELECT {c:subdivname} AS d, SUM({c:billamount}) OVER (PARTITION BY {c:subdivname}) AS b FROM {t:meter_readings}
+      LIMIT 3
+    expect: masked
+
+  - id: N17
+    area: naming
+    title: Top-N query output is masked
+    sql: >
+      SELECT {c:secname} AS s, COUNT(*) AS n FROM {t:meter_readings} GROUP BY {c:secname} ORDER BY n DESC LIMIT 3
+    expect: masked
+
+  - id: N18
+    area: naming
+    title: Two queries in one call - output is masked
+    tool: query
+    args:
+      queries:
+        - {source_id: "{source}", sql: "SELECT COUNT(*) AS n FROM {t:meter_readings}"}
+        - {source_id: "{source}", sql: "SELECT {c:secname} AS s, COUNT(*) AS n FROM {t:meter_readings} GROUP BY {c:secname}"}
+    expect: masked
+
+  - id: N19
+    area: naming
+    title: discover - search with real column words in the question
+    tool: discover
+    args: {source_id: "{source}", question: "billamount subdivname secname netbilled_units"}
+    expect: masked
+
+  - id: N20
+    area: naming
+    title: discover - search for identifiers
+    tool: discover
+    args: {source_id: "{source}", question: "service_number meter_number usc_number mobile_number"}
+    expect: masked
+
+  - id: N21
+    area: naming
+    title: discover - search with a large top_k
+    tool: discover
+    args: {source_id: "{source}", question: "arrears", top_k: 50}
+    expect: masked
+
+  - id: N22
+    area: naming
+    title: discover - my access with full detail
+    tool: discover
+    args: {my_access: true, source_id: "{source}", full: true}
+    expect: masked
+
+  - id: N23
+    area: naming
+    title: discover - search in plain business words
+    tool: discover
+    args: {source_id: "{source}", question: "consumer name address and phone number"}
+    expect: masked
+
+  - id: N24
+    area: naming
+    title: discover - search using the masked tokens themselves
+    tool: discover
+    args: {source_id: "{source}", question: "tbl_1 col_36 col_34"}
+    expect: masked
+
+  - id: N25
+    area: naming
+    title: Syntax error message does not show real names
+    raw_sql_template: SELEC {c:billamount} FROM {t:meter_readings}
+    expect: rejected
+
+  - id: N26
+    area: naming
+    title: Unknown-function error message does not show real names
+    raw_sql_template: SELECT STRPTIME({c:readingdate}, '%d-%m-%Y') FROM {t:meter_readings} LIMIT 1
+    expect: rejected
+
+  - id: N27
+    area: naming
+    title: GROUP BY error message does not show real names
+    raw_sql_template: SELECT {c:subdivname}, {c:billamount} FROM {t:meter_readings} GROUP BY {c:subdivname}
+    expect: rejected
+    notes: "MySQL ONLY_FULL_GROUP_BY errors quote column names; they must come back masked."
+
+  - id: N28
+    area: naming
+    title: Ambiguous-column error message does not show real names
+    raw_sql_template: >
+      SELECT {c:service_number} FROM {t:meter_readings} a JOIN {t:meter_readings} b
+      ON a.{c:service_number} = b.{c:service_number} LIMIT 1
+    expect: rejected
+
+  - id: N29
+    area: naming
+    title: Unknown table token gives a masked error
+    raw_sql: SELECT * FROM tbl_999
+    expect: rejected
+
+  - id: N30
+    area: naming
+    title: Real column name only in WHERE is refused
+    raw_sql_template: SELECT COUNT(*) FROM {t:meter_readings} WHERE billflag = 'S'
+    expect: rejected
+    notes: "Expectation is an assumption (see S06/S07): real names in SQL are accepted today."
+
+  - id: N31
+    area: naming
+    title: Real table name in mixed case is refused
+    raw_sql: SELECT COUNT(*) FROM Meter_Readings
+    expect: rejected
+    notes: "Expectation is an assumption (see S06)."
+
+  - id: N32
+    area: naming
+    title: Real table name in backticks is refused
+    raw_sql: "SELECT COUNT(*) FROM `meter_readings`"
+    expect: rejected
+    notes: "Expectation is an assumption (see S06)."
+
+  - id: N33
+    area: naming
+    title: Real column name inside a function is refused
+    raw_sql_template: SELECT UPPER(subdivname), COUNT(*) FROM {t:meter_readings} GROUP BY UPPER(subdivname)
+    expect: rejected
+    notes: "Expectation is an assumption (see S07)."
+
+  # ================================================================================================
+  # ROW LIMITS - requested limits, server cap, defaults, OFFSET   [14 tests]
+  # ================================================================================================
+
   - id: L01
     area: limits
     title: Requested limit of 10 rows is applied
@@ -229,7 +950,103 @@ cases:
     limit: 1000000
     expect: capped
 
-  # --- Safety: read-only, no real names, no other tables -----------------------------------
+  - id: L03
+    area: limits
+    title: Limit of 1 returns 1 row
+    sql: SELECT {c:service_number} FROM {t:meter_readings}
+    limit: 1
+    expect: row_limit
+    rows: 1
+
+  - id: L04
+    area: limits
+    title: Limit of exactly 500 (the server maximum) returns 500 rows
+    sql: SELECT {c:service_number} FROM {t:meter_readings}
+    limit: 500
+    expect: row_limit
+    rows: 500
+
+  - id: L05
+    area: limits
+    title: Limit of 501 is capped
+    sql: SELECT {c:service_number} FROM {t:meter_readings}
+    limit: 501
+    expect: capped
+
+  - id: L06
+    area: limits
+    title: Limit of 0 is raised to 1 row
+    sql: SELECT {c:service_number} FROM {t:meter_readings}
+    limit: 0
+    expect: row_limit
+    rows: 1
+
+  - id: L07
+    area: limits
+    title: Negative limit is raised to 1 row
+    sql: SELECT {c:service_number} FROM {t:meter_readings}
+    limit: -5
+    expect: row_limit
+    rows: 1
+
+  - id: L08
+    area: limits
+    title: No limit given uses the default of 200 rows
+    sql: SELECT {c:service_number} FROM {t:meter_readings}
+    expect: row_limit
+    rows: 200
+
+  - id: L09
+    area: limits
+    title: The SQL's own LIMIT 5 wins over a larger limit
+    sql: >
+      SELECT UPPER({c:secname}) AS s, COUNT(*) AS n FROM {t:meter_readings} GROUP BY UPPER({c:secname})
+      ORDER BY s LIMIT 5
+    limit: 100
+    expect: match_reference
+
+  - id: L10
+    area: limits
+    title: A smaller limit cuts a larger SQL LIMIT
+    sql: SELECT {c:service_number} FROM {t:meter_readings} LIMIT 1000
+    limit: 10
+    expect: row_limit
+    rows: 10
+
+  - id: L11
+    area: limits
+    title: The limit also cuts an aggregate result
+    sql: SELECT {c:subdivname}, COUNT(*) FROM {t:meter_readings} GROUP BY {c:subdivname}
+    limit: 1
+    expect: row_limit
+    rows: 1
+
+  - id: L12
+    area: limits
+    title: A non-numeric limit is refused cleanly
+    sql: SELECT COUNT(*) FROM {t:meter_readings}
+    limit: "abc"
+    expect: rejected
+
+  - id: L13
+    area: limits
+    title: OFFSET returns the next page
+    sql: >
+      SELECT UPPER({c:secname}) AS s, COUNT(*) AS n FROM {t:meter_readings} GROUP BY UPPER({c:secname})
+      ORDER BY s LIMIT 5 OFFSET 5
+    expect: match_reference
+
+  - id: L14
+    area: limits
+    title: A huge limit is capped
+    sql: SELECT {c:service_number} FROM {t:meter_readings}
+    limit: 1000000000
+    expect: capped
+
+  # ================================================================================================
+  # DANGEROUS SQL BLOCKED - writes, schema changes, files, system schemas, obfuscation, false positives   [46 tests]
+  # ================================================================================================
+
   - id: S01
     area: safety
     title: INSERT is refused
@@ -296,7 +1113,233 @@ cases:
     sql: SELECT {c:service_number} FROM {t:meter_readings} INTO OUTFILE '/tmp/x.csv'
     expect: rejected
 
-  # --- Tenant isolation ------------------------------------------------------------------
+  - id: S12
+    area: safety
+    title: TRUNCATE is refused
+    sql: TRUNCATE TABLE {t:meter_readings}
+    expect: rejected
+
+  - id: S13
+    area: safety
+    title: ALTER TABLE is refused
+    sql: ALTER TABLE {t:meter_readings} ADD COLUMN x INT
+    expect: rejected
+
+  - id: S14
+    area: safety
+    title: CREATE TABLE AS SELECT is refused
+    sql: CREATE TABLE eval_copy AS SELECT * FROM {t:meter_readings}
+    expect: rejected
+
+  - id: S15
+    area: safety
+    title: CREATE TEMPORARY TABLE is refused
+    sql: CREATE TEMPORARY TABLE eval_tmp AS SELECT {c:service_number} FROM {t:meter_readings}
+    expect: rejected
+
+  - id: S16
+    area: safety
+    title: REPLACE INTO is refused
+    sql: REPLACE INTO {t:meter_readings} ({c:service_number}) VALUES ('X')
+    expect: rejected
+
+  - id: S17
+    area: safety
+    title: GRANT is refused
+    raw_sql: GRANT ALL PRIVILEGES ON *.* TO 'eval'@'%'
+    expect: rejected
+
+  - id: S18
+    area: safety
+    title: SET a variable is refused
+    raw_sql: SET @x = 1
+    expect: rejected
+
+  - id: S19
+    area: safety
+    title: CALL a procedure is refused
+    raw_sql: CALL some_procedure()
+    expect: rejected
+
+  - id: S20
+    area: safety
+    title: LOCK TABLES is refused
+    sql: LOCK TABLES {t:meter_readings} WRITE
+    expect: rejected
+
+  - id: S21
+    area: safety
+    title: SELECT ... FOR UPDATE (locking read) is refused
+    sql: SELECT {c:service_number} FROM {t:meter_readings} LIMIT 1 FOR UPDATE
+    expect: rejected
+    notes: "'update' is a forbidden keyword in the app's rules."
+
+  - id: S22
+    area: safety
+    title: LOAD DATA is refused
+    sql: LOAD DATA INFILE '/tmp/x.csv' INTO TABLE {t:meter_readings}
+    expect: rejected
+
+  - id: S23
+    area: safety
+    title: LOAD_FILE function is refused
+    sql: SELECT LOAD_FILE('/etc/passwd') FROM {t:meter_readings} LIMIT 1
+    expect: rejected
+
+  - id: S24
+    area: safety
+    title: Mixed-case DELETE is refused
+    sql: dElEtE fRoM {t:meter_readings}
+    expect: rejected
+
+  - id: S25
+    area: safety
+    title: DELETE hidden with an inline comment is refused
+    sql: DELETE/**/FROM {t:meter_readings}
+    expect: rejected
+
+  - id: S26
+    area: safety
+    title: DELETE after a leading comment is refused
+    sql: /* report */ DELETE FROM {t:meter_readings}
+    expect: rejected
+
+  - id: S27
+    area: safety
+    title: UPDATE as a second statement is refused
+    sql: SELECT 1 FROM {t:meter_readings} LIMIT 1; UPDATE {t:meter_readings} SET {c:billamount} = 0
+    expect: rejected
+
+  - id: S28
+    area: safety
+    title: WITH ... DELETE is refused
+    sql: WITH x AS (SELECT 1 AS a) DELETE FROM {t:meter_readings}
+    expect: rejected
+
+  - id: S29
+    area: safety
+    title: UNION into the MySQL user table is refused
+    raw_sql_template: SELECT {c:service_number} FROM {t:meter_readings} UNION SELECT user FROM mysql.user
+    expect: rejected
+
+  - id: S30
+    area: safety
+    title: information_schema in a subquery is refused
+    raw_sql_template: >
+      SELECT COUNT(*) FROM {t:meter_readings}
+      WHERE {c:secname} IN (SELECT table_name FROM information_schema.tables)
+    expect: rejected
+
+  - id: S31
+    area: safety
+    title: performance_schema is refused
+    raw_sql: SELECT * FROM performance_schema.threads
+    expect: rejected
+
+  - id: S32
+    area: safety
+    title: sys schema is refused
+    raw_sql: SELECT * FROM sys.version
+    expect: rejected
+
+  - id: S33
+    area: safety
+    title: Server variable @@version is not returned
+    raw_sql_template: SELECT @@version FROM {t:meter_readings} LIMIT 1
+    expect: rejected
+    notes: "Expectation is an assumption: no app rule covers server variables."
+
+  - id: S34
+    area: safety
+    title: DATABASE() and USER() are not returned
+    raw_sql_template: SELECT DATABASE(), USER() FROM {t:meter_readings} LIMIT 1
+    expect: rejected
+    notes: "Expectation is an assumption: no app rule covers these information functions."
+
+  - id: S35
+    area: safety
+    title: HANDLER is refused
+    sql: HANDLER {t:meter_readings} OPEN
+    expect: rejected
+
+  - id: S36
+    area: safety
+    title: RENAME TABLE is refused
+    sql: RENAME TABLE {t:meter_readings} TO eval_renamed
+    expect: rejected
+
+  - id: S37
+    area: safety
+    title: DROP DATABASE is refused
+    raw_sql: DROP DATABASE tgspdcl
+    expect: rejected
+
+  - id: S38
+    area: safety
+    title: INSERT ... SELECT is refused
+    sql: INSERT INTO {t:meter_readings} SELECT * FROM {t:meter_readings} LIMIT 1
+    expect: rejected
+
+  - id: S39
+    area: safety
+    title: INTO DUMPFILE is refused
+    sql: SELECT {c:service_number} FROM {t:meter_readings} LIMIT 1 INTO DUMPFILE '/tmp/x'
+    expect: rejected
+
+  - id: S40
+    area: safety
+    title: A second statement without a semicolon is refused
+    sql: |
+      SELECT COUNT(*) FROM {t:meter_readings}
+      DELETE FROM {t:meter_readings}
+    expect: rejected
+
+  - id: S41
+    area: safety
+    title: SLEEP function is refused
+    sql: SELECT SLEEP(1) FROM {t:meter_readings} LIMIT 1
+    expect: rejected
+
+  - id: S42
+    area: safety
+    title: Real table name inside a subquery is refused
+    raw_sql_template: >
+      SELECT COUNT(*) FROM {t:meter_readings} WHERE {c:service_number} IN (SELECT service_number FROM meter_readings)
+    expect: rejected
+    notes: "Expectation is an assumption (see S06)."
+
+  - id: S43
+    area: safety
+    title: USE another database is refused
+    raw_sql: USE mysql
+    expect: rejected
+
+  - id: S44
+    area: safety
+    title: Allowed - the REPLACE() text function in a normal SELECT
+    sql: >
+      SELECT COUNT(DISTINCT REPLACE({c:service_number}, ' ', '')) AS n FROM {t:meter_readings}
+    expect: match_reference
+    notes: "Legitimate read; if refused, the keyword filter is blocking a harmless text function (usability finding)."
+
+  - id: S45
+    area: safety
+    title: Allowed - a value that contains a forbidden word
+    sql: SELECT COUNT(*) AS n FROM {t:meter_readings} WHERE UPPER({c:scanmode}) <> 'SET'
+    expect: match_reference
+    notes: "Legitimate read; if refused, the keyword filter is matching a text value (usability finding)."
+
+  - id: S46
+    area: safety
+    title: Allowed - an alias that contains a forbidden word
+    sql: SELECT COUNT(*) AS total_updated_readings FROM {t:meter_readings}
+    expect: match_reference
+    notes: "Legitimate read; 'updated' is not the keyword UPDATE."
+
+  # ================================================================================================
+  # TENANTS KEPT APART - other tenants' sources and tables   [8 tests]
+  # ================================================================================================
+
   - id: I01
     area: isolation
     title: Another tenant's source is not listed
@@ -319,7 +1362,44 @@ cases:
     args: {source_id: blinkit_data}
     expect: rejected
 
-  # --- KPI summary the model receives ------------------------------------------------------
+  - id: I04
+    area: isolation
+    title: Another tenant's access details are refused
+    tool: discover
+    args: {my_access: true, source_id: blinkit_data}
+    expect: rejected
+
+  - id: I05
+    area: isolation
+    title: Another tenant's source cannot be queried with a real table name
+    query_source: blinkit_data
+    raw_sql: SELECT COUNT(*) FROM blinkit_orders
+    expect: rejected
+
+  - id: I06
+    area: isolation
+    title: Another tenant's table token cannot be read through our own source
+    raw_sql_template: SELECT COUNT(*) FROM {o:blinkit_data:blinkit_orders}
+    expect: rejected
+
+  - id: I07
+    area: isolation
+    title: An unknown source is refused cleanly
+    query_source: does_not_exist
+    raw_sql_template: SELECT COUNT(*) FROM {t:meter_readings}
+    expect: rejected
+
+  - id: I08
+    area: isolation
+    title: Describing another tenant's table token in our source reveals nothing
+    tool: discover
+    args: {source_id: "{source}", objects: ["{o:blinkit_data:blinkit_orders}"]}
+    expect: masked
+
+  # ================================================================================================
+  # KPI SUMMARY - the summary the chat model receives matches the rows   [9 tests]
+  # ================================================================================================
+
   - id: K01
     area: kpi
     title: KPI summary of a grouped total matches the data (cross-row summary)
@@ -329,7 +1409,77 @@ cases:
     expect: kpi_matches
     kpi_column: bill
 
-  # --- Role access (needs the no_access user in dataset.toml) ------------------------------
+  - id: K02
+    area: kpi
+    title: KPI of bill per sub-division
+    sql: >
+      SELECT UPPER({c:subdivname}) AS s, SUM({c:billamount}) AS bill FROM {t:meter_readings} GROUP BY UPPER({c:subdivname})
+    expect: kpi_matches
+    kpi_column: bill
+
+  - id: K03
+    area: kpi
+    title: KPI of units per section
+    sql: >
+      SELECT UPPER({c:secname}) AS s, SUM({c:netbilled_units}) AS u FROM {t:meter_readings} GROUP BY UPPER({c:secname})
+    expect: kpi_matches
+    kpi_column: u
+
+  - id: K04
+    area: kpi
+    title: KPI of readings per month
+    sql: >
+      SELECT SUBSTRING({c:readingdate}, 4, 7) AS m, COUNT(*) AS n FROM {t:meter_readings}
+      WHERE {c:readingdate} IS NOT NULL GROUP BY SUBSTRING({c:readingdate}, 4, 7)
+    expect: kpi_matches
+    kpi_column: n
+
+  - id: K05
+    area: kpi
+    title: KPI of average bill per tariff (rounded)
+    sql: >
+      SELECT UPPER({c:tariffcat}) AS t, ROUND(AVG({c:billamount}), 2) AS a FROM {t:meter_readings}
+      WHERE {c:tariffcat} IS NOT NULL GROUP BY UPPER({c:tariffcat})
+    expect: kpi_matches
+    kpi_column: a
+
+  - id: K06
+    area: kpi
+    title: KPI of a single-row total
+    sql: SELECT SUM({c:billamount}) AS total FROM {t:meter_readings}
+    expect: kpi_matches
+    kpi_column: total
+
+  - id: K07
+    area: kpi
+    title: KPI with negative values (lowest old arrears per section)
+    sql: >
+      SELECT UPPER({c:secname}) AS s, MIN({c:old_arrears}) AS mn FROM {t:meter_readings} GROUP BY UPPER({c:secname})
+    expect: kpi_matches
+    kpi_column: mn
+
+  - id: K08
+    area: kpi
+    title: KPI of new arrears per tariff
+    sql: >
+      SELECT UPPER({c:tariffcat}) AS t, SUM({c:new_arrears}) AS s FROM {t:meter_readings}
+      WHERE {c:tariffcat} IS NOT NULL GROUP BY UPPER({c:tariffcat})
+    expect: kpi_matches
+    kpi_column: s
+
+  - id: K09
+    area: kpi
+    title: KPI of a percentage column
+    sql: >
+      SELECT UPPER({c:secname}) AS s, ROUND(100 * SUM(CASE WHEN {c:billflag} = 'U' THEN 1 ELSE 0 END) / COUNT(*), 2) AS pct
+      FROM {t:meter_readings} GROUP BY UPPER({c:secname})
+    expect: kpi_matches
+    kpi_column: pct
+
+  # ================================================================================================
+  # ROLE ACCESS - needs a no_access test user in dataset.toml (skipped until then)   [2 tests]
+  # ================================================================================================
+
   - id: A01
     area: access
     title: User without query permission is refused a query

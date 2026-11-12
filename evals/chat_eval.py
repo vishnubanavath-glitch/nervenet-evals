@@ -27,7 +27,9 @@ class GoldenTurn:
     expected_sql: str | None = None
     match: str = "rows"                 # rows | contains | none
     expected_behavior: str | None = None
+    expected_answer: str | None = None       # the answer a good assistant gives (from the CSV)
     labels: dict[str, list[str]] = field(default_factory=dict)  # code -> words the chat may show instead
+    expect: dict[str, Any] = field(default_factory=dict)        # feature expectations (chart, report, ...)
     expected: dict[str, Any] | None = None   # filled from the reference: {"columns", "rows"}
 
 
@@ -37,6 +39,8 @@ class GoldenCase:
     turns: list[GoldenTurn]
     notes: str = ""
     user: str = "full_access"
+    level: str = ""
+    tags: list[str] = field(default_factory=list)
 
     @property
     def multi_turn(self) -> bool:
@@ -50,6 +54,7 @@ class GoldenCase:
 
 
 def load_cases(ds: Dataset, filename: str = "chat.yaml") -> list[GoldenCase]:
+    """The cases in the dataset's goldens/chat.yaml."""
     raw = yaml.safe_load((ds.goldens_dir / filename).read_text(encoding="utf-8"))
     out = []
     for c in raw["cases"]:
@@ -57,9 +62,13 @@ def load_cases(ds: Dataset, filename: str = "chat.yaml") -> list[GoldenCase]:
         turns = [GoldenTurn(question=t["question"], expected_sql=t.get("expected_sql"),
                             match=t.get("match", "rows" if t.get("expected_sql") else "none"),
                             expected_behavior=t.get("expected_behavior"),
-                            labels={str(k): [str(x) for x in v] for k, v in {**case_labels, **(t.get("labels") or {})}.items()})
+                            expected_answer=t.get("expected_answer"),
+                            labels={str(k): [str(x) for x in v] for k, v in {**case_labels, **(t.get("labels") or {})}.items()},
+                            expect=dict(t.get("expect") or {}))
                  for t in c["turns"]]
-        out.append(GoldenCase(id=c["id"], turns=turns, notes=c.get("notes", ""), user=c.get("user", "full_access")))
+        out.append(GoldenCase(id=c["id"], turns=turns, notes=" ".join(str(c.get("notes", "")).split()),
+                              user=c.get("user", "full_access"), level=c.get("level", ""),
+                              tags=list(c.get("tags") or [])))
     return out
 
 
@@ -218,15 +227,21 @@ def check_tools_ok(trace: dict[str, Any], turn: Any) -> checks.CheckResult:
 
 
 def expected_text(turn: GoldenTurn, notes: str = "") -> str:
-    if turn.match == "none":
-        return turn.expected_behavior or ""
+    parts = []
     exp = turn.expected or {}
-    rows = exp.get("rows") or []
-    shown = "\n".join(" | ".join("" if v is None else str(v) for v in r) for r in rows[:30])
-    text = f"Correct result from the data ({len(rows)} row(s); columns: {', '.join(exp.get('columns', []))}):\n{shown}"
+    if exp.get("rows") is not None:
+        rows = exp["rows"]
+        shown = "\n".join(" | ".join("" if v is None else str(v) for v in r) for r in rows[:30])
+        # Column names are left out: they are the real names the app hides (this text is uploaded).
+        parts.append(f"Correct result from the data ({len(rows)} row(s)):\n{shown}")
+    if turn.expected_answer:
+        parts.append("Expected answer (the figures and insights a correct answer gives):\n"
+                     + turn.expected_answer.strip())
+    if turn.expected_behavior:
+        parts.append("Required behaviour: " + " ".join(turn.expected_behavior.split()))
     if notes:
-        text += f"\nMeaning notes: {notes}"
-    return text
+        parts.append(f"Meaning notes: {notes}")
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------

@@ -46,14 +46,27 @@ def write_review(cases, path: Path) -> None:
            "and **is the note's meaning correct?** Mark each ✅ keep / ✏️ change / ❌ remove, and add any questions you want.",
            "", "Expected answers are calculated from the CSV. *rows* = the table must have exactly these rows; "
            "*contains* = these rows must appear (more allowed).", "",
-           "| # | Question | Expected answer | Note to confirm | Your verdict |", "|---|---|---|---|---|"]
+           "| # | Level | Question | Expected answer | Also expected | Note to confirm | Your verdict |",
+           "|---|---|---|---|---|---|---|"]
+    from collections import Counter
+    counts = Counter(c.level or "-" for c in cases)
+    out[1:1] = ["", "**Cases by level:** " + " · ".join(f"{k} {v}" for k, v in counts.items())
+                + f" · **total {len(cases)}** ({sum(len(c.turns) for c in cases)} turns)", ""]
     for c in cases:
         for i, t in enumerate(c.turns, 1):
             cid = c.id + (f" turn {i}" if c.multi_turn else "")
-            exp = (f"*{t.match}*<br>{fmt_rows(t.expected['rows'])}" if t.expected
-                   else "*behaviour:* " + " ".join((t.expected_behavior or "").split()))
+            parts = []
+            if t.expected and t.match != "none":
+                parts.append(f"*{t.match}*<br>{fmt_rows(t.expected['rows'])}")
+            elif t.expected:
+                parts.append(f"*(reference)*<br>{fmt_rows(t.expected['rows'])}")
+            if t.expected_behavior:
+                parts.append("*behaviour:* " + " ".join(t.expected_behavior.split()))
+            exp = "<br>".join(parts) or "-"
+            also = ", ".join(f"{k}: {v}" for k, v in (t.expect or {}).items())
             note = c.notes if i == 1 else ""
-            out.append(f"| {cid} | {t.question.replace('|', '/')} | {exp.replace('|', '/')} | {note.replace('|', '/')} | |")
+            out.append(f"| {cid} | {c.level if i == 1 else ''} | {t.question.replace('|', '/')} | {exp.replace('|', '/')} "
+                       f"| {also} | {note.replace('|', '/')} | |")
     path.write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
@@ -147,6 +160,39 @@ def run_judge(ds, records: dict[str, dict[str, Any]]) -> tuple[dict[str, dict[st
     from evals.chat_eval import conversation_metrics, single_turn_metrics
 
     judge = get_judge()
+    # The expected text goes to the judge and, when CONFIDENT_API_KEY is set, to Confident AI:
+    # turn real column names (in notes) into plain words so only masked data leaves this machine.
+    import csv
+    import re as _re
+    with open(ds.reference_file, encoding="utf-8", newline="") as fh:
+        real_cols = sorted(next(csv.reader(fh)), key=len, reverse=True)
+    name_re = _re.compile(r"\b(" + "|".join(_re.escape(c) for c in real_cols) + r")\b")
+
+    plain = {
+        "billflag": "bill flag", "gj_flag": "Gruha Jyothi flag", "gjbilledflag": "Gruha Jyothi billed flag",
+        "subsidy_flag": "subsidy flag", "meter_phase": "meter phase", "readingdate": "reading date",
+        "tariffcat": "tariff category", "subdivname": "sub-division", "subdivcd": "sub-division code",
+        "secname": "section", "eroname": "ERO name", "erocode": "ERO code", "cirname": "circle", "divname": "division",
+        "last_paid_date": "last paid date", "previous_reading_date": "previous reading date",
+        "presentreading": "present reading", "previous_kwh_reading": "previous reading",
+        "netbilled_units": "net billed units", "billamount": "bill amount", "totalamount": "total payable",
+        "old_arrears": "old arrears", "new_arrears": "new arrears", "analysisremark": "analysis remark",
+        "scanmode": "scan mode", "readingtype": "reading type", "matched_source": "matched source",
+        "meter_change_flag": "meter change flag", "irda_flag": "IRDA flag", "spotbilldays": "billing days",
+        "spotmd": "spot maximum demand", "billdemand": "bill demand", "contracted_load": "contracted load",
+        "meter_number": "meter number", "service_number": "service number", "usc_number": "USC number",
+        "dtrcode": "DTR code", "mobile_number": "mobile number", "aaomobileno": "AAO mobile number",
+        "spotprsmrdg": "spot present reading", "spotavg": "spot average", "meter_type": "meter type",
+        "multiplication_factor": "multiplication factor", "solar_meter_flag": "solar meter flag",
+        "solar_kwh_meter_reading": "solar meter reading", "previous_status": "previous status",
+        "sub_category": "sub category", "area_code": "area code", "bigimg": "meter image",
+        "address_1": "address line 1", "address_2": "address line 2",
+    }
+
+    def unmask_free(text: str) -> str:
+        text = _re.sub(r"\bmeter_readings\b", "the meter readings table", text or "")
+        return name_re.sub(lambda m: plain.get(m.group(1), m.group(1).replace("_", " ")), text)
+
     singles, convs = [], []
     for cid, rec in records.items():
         if rec.get("error"):
@@ -157,7 +203,7 @@ def run_judge(ds, records: dict[str, dict[str, Any]]) -> tuple[dict[str, dict[st
             checks_meta = {c["name"]: c["passed"] for c in t["checks"] + t["governance"]}
             singles.append(LLMTestCase(
                 name=t["name"], input=ji["input"], actual_output=ji["actual_output"],
-                expected_output=ji["expected_output"], retrieval_context=ji["retrieval_context"],
+                expected_output=unmask_free(ji["expected_output"]), retrieval_context=ji["retrieval_context"],
                 tools_called=[ToolCall(name=x["name"], input_parameters=x["arguments"]) for x in ji["tools"]],
                 additional_metadata={"dataset": ds.name, "case": cid, "kind": rec["kind"], "checks": checks_meta,
                                      "chat_cost_usd": round(t["chat_cost_usd"], 4), **t["usage"]}))
@@ -347,9 +393,7 @@ def main() -> int:
     fill_expected(cases, Reference(ds))
     if args.preview:
         preview(cases)
-        review = ds.goldens_dir / "chat_review.md"
-        write_review(cases, review)
-        print(f"\n{len(cases)} case(s). Nothing was sent to the app.\nReview file: {review}")
+        print(f"\n{len(cases)} case(s). Nothing was sent to the app.")
         return 0
 
     writer = RunWriter(ds.name, "chat")

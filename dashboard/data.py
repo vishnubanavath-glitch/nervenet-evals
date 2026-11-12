@@ -164,7 +164,8 @@ def list_datasets() -> list[str]:
 
 
 def golden_path(dataset: str, kind: str) -> Path:
-    return DATASETS_DIR / dataset / "goldens" / ("chat.yaml" if kind == "chat" else "tools.yaml")
+    """One golden file per evaluation: goldens/chat.yaml, goldens/tools.yaml (later: schema_context.yaml)."""
+    return DATASETS_DIR / dataset / "goldens" / f"{kind}.yaml"
 
 
 def judge_model_name() -> str:
